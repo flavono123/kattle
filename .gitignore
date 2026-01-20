@@ -27,3 +27,5 @@ assets/releases/
 *.pb.gz
 *_goroutine.txt
 *_heap.*
+
+./claude

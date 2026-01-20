@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { EventsOn } from '../../wailsjs/runtime/runtime';
-import { StartWatch, StopWatch, GetResourcesByKeys } from '../../wailsjs/go/main/App';
+import { StartWatch, StopWatch, GetResourcesByKeys, GetAllResourceKeys } from '../../wailsjs/go/main/App';
 import type { main } from '../../wailsjs/go/models';
 import { getResourceKey, type ResourceEventMeta, type CellChange, diffFields } from '../lib/resource-utils';
 
@@ -104,10 +104,27 @@ export function useResourceData(
         if (watchGen !== watchGenRef.current) return;
         return StartWatch(gvk, contexts);
       })
-      .then(() => {
+      .then(async () => {
         if (watchGen !== watchGenRef.current) return;
         console.log(`useResourceData: watch connected for ${gvk.kind}`);
         setWatchStatus('connected');
+
+        // Fetch all keys from FieldStore after initial sync completes.
+        // This is critical because trySend drops events when buffer is full during initial sync.
+        // Without this, only a fraction of resources would be displayed.
+        try {
+          const allKeys = await GetAllResourceKeys();
+          if (watchGen !== watchGenRef.current) return;
+          if (allKeys && allKeys.length > 0) {
+            console.log(`useResourceData: fetched ${allKeys.length} initial keys for ${gvk.kind}`);
+            hasReceivedAnyEvent.current = true;
+            for (const key of allKeys) {
+              pendingKeys.current.add(key);
+            }
+          }
+        } catch (err) {
+          console.error('useResourceData: failed to get initial keys:', err);
+        }
 
         // Set timeout to complete loading only if no events have been received
         // This handles GVKs with 0 resources
@@ -273,9 +290,23 @@ export function useResourceData(
         if (watchGen !== watchGenRef.current) return;
         return StartWatch(gvk, contexts);
       })
-      .then(() => {
+      .then(async () => {
         if (watchGen !== watchGenRef.current) return;
         setWatchStatus('connected');
+
+        // Fetch all keys from FieldStore after initial sync completes
+        try {
+          const allKeys = await GetAllResourceKeys();
+          if (watchGen !== watchGenRef.current) return;
+          if (allKeys && allKeys.length > 0) {
+            hasReceivedAnyEvent.current = true;
+            for (const key of allKeys) {
+              pendingKeys.current.add(key);
+            }
+          }
+        } catch (err) {
+          console.error('useResourceData: failed to get initial keys on refresh:', err);
+        }
 
         // Set timeout to complete loading only if no events received
         setTimeout(() => {

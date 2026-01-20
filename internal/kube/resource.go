@@ -57,7 +57,8 @@ type ResourceController struct {
 	contextName string // optional, for GUI multi-context support
 	client      dynamic.Interface
 	gvr         schema.GroupVersionResource
-	store       cache.Store
+	store       cache.Store       // may be KeyOnlyStore (memory-efficient) or default store
+	keyStore    *KeyOnlyStore     // non-nil when using memory-efficient mode
 	emitCh      chan emitMsg
 	doneCh      chan struct{} // signals that controller is closed (for event consumers)
 	closed      atomic.Bool   // guards trySend to prevent sends after close
@@ -127,6 +128,120 @@ func (i *ResourceController) Objects() []*unstructured.Unstructured {
 	return objs
 }
 
+// SyncCallback is called synchronously for each object during initial sync.
+// This runs in the informer's goroutine, so there's no race condition.
+type SyncCallback func(eventType EventType, obj *unstructured.Unstructured)
+
+// InformWithKeyOnlyStore starts the informer with a memory-efficient KeyOnlyStore.
+// This is the recommended method for GUI usage where FieldStore handles data storage.
+// Objects are NOT retained in memory after event handlers process them.
+//
+// The onSync callback is called synchronously for each object during initial list sync.
+// This guarantees all initial objects are processed without race conditions.
+// After sync completes, ongoing events are emitted via WatchEvents() channel.
+func (i *ResourceController) InformWithKeyOnlyStore(onSync SyncCallback) (chan struct{}, error) {
+	lw := &cache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return i.client.Resource(i.gvr).Namespace("").List(context.Background(), options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return i.client.Resource(i.gvr).Namespace("").Watch(context.Background(), options)
+		},
+	}
+
+	// Use KeyOnlyStore instead of default store to avoid retaining full objects
+	keyStore := NewKeyOnlyStore(cache.MetaNamespaceKeyFunc)
+	i.keyStore = keyStore
+	i.store = keyStore
+
+	// Create DeltaFIFO with KeyOnlyStore as KnownObjects
+	fifo := cache.NewDeltaFIFOWithOptions(cache.DeltaFIFOOptions{
+		KnownObjects:          keyStore,
+		EmitDeltaTypeReplaced: true,
+	})
+
+	// Process function handles events and updates KeyOnlyStore
+	process := func(obj interface{}, isInInitialList bool) error {
+		deltas, ok := obj.(cache.Deltas)
+		if !ok {
+			return fmt.Errorf("expected Deltas, got %T", obj)
+		}
+
+		for _, delta := range deltas {
+			u, ok := delta.Object.(*unstructured.Unstructured)
+			if !ok {
+				continue
+			}
+
+			key, _ := cache.MetaNamespaceKeyFunc(u)
+
+			switch delta.Type {
+			case cache.Added, cache.Replaced, cache.Sync:
+				// Update KeyOnlyStore (only tracks keys)
+				keyStore.Add(u)
+				// Cache name for sorting
+				i.nameCacheMu.Lock()
+				i.nameCache[key] = u.GetName()
+				i.nameCacheMu.Unlock()
+
+				if isInInitialList && onSync != nil {
+					// During initial sync: call callback synchronously (no race condition)
+					onSync(EventAdded, u)
+				} else {
+					// After sync: emit via channel (may drop if buffer full)
+					i.trySend(emitMsg{Type: EventAdded, Obj: u})
+				}
+
+			case cache.Updated:
+				keyStore.Update(u)
+				i.nameCacheMu.Lock()
+				i.nameCache[key] = u.GetName()
+				i.nameCacheMu.Unlock()
+
+				if isInInitialList && onSync != nil {
+					onSync(EventModified, u)
+				} else {
+					i.trySend(emitMsg{Type: EventModified, Obj: u})
+				}
+
+			case cache.Deleted:
+				keyStore.Delete(u)
+				i.nameCacheMu.Lock()
+				delete(i.nameCache, key)
+				i.nameCacheMu.Unlock()
+
+				if isInInitialList && onSync != nil {
+					onSync(EventDeleted, u)
+				} else {
+					i.trySend(emitMsg{Type: EventDeleted, Obj: u})
+				}
+			}
+		}
+		return nil
+	}
+
+	cfg := &cache.Config{
+		Queue:            fifo,
+		ListerWatcher:    lw,
+		ObjectType:       &unstructured.Unstructured{},
+		FullResyncPeriod: 0, // No resync
+		Process:          process,
+	}
+
+	controller := cache.New(cfg)
+	stop := make(chan struct{})
+	go controller.Run(stop)
+
+	if !cache.WaitForCacheSync(stop, controller.HasSynced) {
+		close(stop)
+		return nil, fmt.Errorf("failed to sync cache")
+	}
+
+	return stop, nil
+}
+
+// Inform starts the informer with default cache.Store (legacy, for TUI compatibility).
+// Use InformWithKeyOnlyStore for memory-efficient GUI usage.
 func (i *ResourceController) Inform() (chan struct{}, error) {
 	lw := &cache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {

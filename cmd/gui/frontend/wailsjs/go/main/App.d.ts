@@ -6,6 +6,8 @@ export function ConnectToContexts(arg1:Array<string>):Promise<Array<main.Context
 
 export function DeleteFavoriteView(arg1:string):Promise<void>;
 
+export function GetAllResourceKeys():Promise<Array<string>>;
+
 export function GetCurrentContext():Promise<string>;
 
 export function GetDefaultSelectedPaths(arg1:main.MultiClusterGVK,arg2:Array<string>):Promise<Array<any>>;
@@ -33,6 +35,8 @@ export function RenameFavoriteView(arg1:string,arg2:string):Promise<main.Favorit
 export function SaveFavoriteView(arg1:string,arg2:string,arg3:string,arg4:string,arg5:Array<any>):Promise<main.FavoriteViewResponse>;
 
 export function SaveFile(arg1:string,arg2:string):Promise<string>;
+
+export function SetSelectedFields(arg1:Array<string>):Promise<void>;
 
 export function StartWatch(arg1:main.MultiClusterGVK,arg2:Array<string>):Promise<void>;
 

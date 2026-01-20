@@ -34,11 +34,11 @@ type App struct {
 	favoriteStore *store.Store
 
 	// Watch state
-	watchMu       sync.RWMutex
-	controllers   []*watchController
-	stopChs       []chan struct{}
-	watchDone     chan struct{}
-	resourceCache sync.Map // key: "context/namespace/name" → value: map[string]any
+	watchMu     sync.RWMutex
+	controllers []*watchController
+	stopChs     []chan struct{}
+	watchDone   chan struct{}
+	fieldStore  *kube.FieldStore // key: "context/namespace/name" → value: extracted fields
 }
 
 // watchController wraps a ResourceController with context info
@@ -284,20 +284,21 @@ func (a *App) GetNodeTree(gvk MultiClusterGVK, contexts []string) ([]*TreeNode, 
 		return nil, fmt.Errorf("failed to create field tree: %w", err)
 	}
 
-	// 2. Get resources - prefer active watch store to avoid duplicate List calls
-	objs := a.getWatchedResources()
-	if len(objs) == 0 {
-		// No active watch, fetch directly (with cleanup)
-		objs, err = a.getResourcesWithCleanup(schemaGVK, contexts)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get resources: %w", err)
+	// 2. Create node tree - use FieldStore if watches are active (memory-efficient)
+	var nodes map[string]*kube.Node
+	if a.fieldStore.Count() > 0 {
+		// Use FieldStore's structure metadata for tree building
+		nodes = kube.CreateNodeTreeFromStore(fields, a.fieldStore, []string{})
+	} else {
+		// No active watch, fetch resources directly for tree building
+		objs, fetchErr := a.getResourcesWithCleanup(schemaGVK, contexts)
+		if fetchErr != nil {
+			return nil, fmt.Errorf("failed to get resources: %w", fetchErr)
 		}
+		nodes = kube.CreateNodeTree(fields, objs, []string{})
 	}
 
-	// 3. Create node tree
-	nodes := kube.CreateNodeTree(fields, objs, []string{})
-
-	// 4. Convert to frontend format (remove UI state, convert to array)
+	// 3. Convert to frontend format (remove UI state, convert to array)
 	return convertNodeTree(nodes), nil
 }
 
@@ -451,6 +452,7 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string) error {
 	a.controllers = make([]*watchController, 0, len(contexts))
 	a.stopChs = make([]chan struct{}, 0, len(contexts))
 	a.watchDone = make(chan struct{})
+	a.fieldStore = kube.NewFieldStore()
 
 	var wg sync.WaitGroup
 
@@ -462,21 +464,42 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string) error {
 		}
 
 		controller := kube.NewResourceControllerForContext(contextName, gvr)
-		stopCh, err := controller.Inform()
+		ctx := contextName // capture for closures
+
+		// Synchronous callback for initial sync - called in informer's goroutine, no race condition.
+		// This populates FieldStore directly during WaitForCacheSync, before any event can be dropped.
+		onSync := func(eventType kube.EventType, obj *unstructured.Unstructured) {
+			key := makeResourceKey(ctx, obj.GetNamespace(), obj.GetName())
+			if eventType == kube.EventDeleted {
+				a.fieldStore.Delete(key)
+			} else {
+				a.fieldStore.Update(key, obj)
+			}
+			// Note: We don't emit events to frontend during initial sync.
+			// Frontend calls GetAllResourceKeys() after StartWatch returns.
+		}
+
+		// Start the informer with KeyOnlyStore for memory efficiency.
+		// The onSync callback processes all initial objects synchronously.
+		// After sync completes, ongoing events are emitted via WatchEvents() channel.
+		stopCh, err := controller.InformWithKeyOnlyStore(onSync)
 		if err != nil {
 			log.Printf("Warning: failed to start watch for %s in context %s: %v", schemaGVK.Kind, contextName, err)
 			continue
 		}
 
+		log.Printf("Initial sync complete for context %s, FieldStore count: %d", ctx, a.fieldStore.Count())
+
 		a.controllers = append(a.controllers, &watchController{
-			contextName: contextName,
+			contextName: ctx,
 			controller:  controller,
 		})
 		a.stopChs = append(a.stopChs, stopCh)
 
-		// Start goroutine to forward events to frontend (Pull Model)
+		// Start goroutine to forward ONGOING events to frontend (after initial sync).
+		// These are real-time updates from watch, not initial list.
 		wg.Add(1)
-		go func(ctx string, ctrl *kube.ResourceController) {
+		go func(ctxName string, ctrl *kube.ResourceController) {
 			defer wg.Done()
 			for {
 				select {
@@ -485,16 +508,12 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string) error {
 						continue // skip invalid events
 					}
 
-					key := makeResourceKey(ctx, event.Obj.GetNamespace(), event.Obj.GetName())
+					key := makeResourceKey(ctxName, event.Obj.GetNamespace(), event.Obj.GetName())
 
 					if string(event.Type) == "DELETED" {
-						// Remove from cache on delete
-						a.resourceCache.Delete(key)
+						a.fieldStore.Delete(key)
 					} else {
-						// Store in cache for ADDED/MODIFIED
-						obj := event.Obj.Object
-						obj["_context"] = ctx
-						a.resourceCache.Store(key, obj)
+						a.fieldStore.Update(key, event.Obj)
 					}
 
 					// Emit only lightweight metadata (no full object via eval)
@@ -506,7 +525,7 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string) error {
 					return
 				}
 			}
-		}(contextName, controller)
+		}(ctx, controller)
 	}
 
 	// Wait for all event forwarders to finish in background
@@ -552,11 +571,11 @@ func (a *App) StopWatch() {
 	a.stopChs = nil
 	a.watchDone = nil
 
-	// Clear resource cache
-	a.resourceCache.Range(func(key, value any) bool {
-		a.resourceCache.Delete(key)
-		return true
-	})
+	// Clear field store
+	if a.fieldStore != nil {
+		a.fieldStore.Clear()
+	}
+	a.fieldStore = nil
 
 	log.Printf("Stopped all resource watches")
 	logMemoryStats("StopWatch")
@@ -565,18 +584,48 @@ func (a *App) StopWatch() {
 	kube.ResetEventMetrics()
 }
 
-// GetResourcesByKeys fetches resources from cache by keys (Pull Model)
+// SetSelectedFields updates the fields to extract for table display.
+// Called by frontend when user changes column selection.
+// Fields should be dot-notation paths like "status.phase", "spec.replicas".
+func (a *App) SetSelectedFields(fields []string) {
+	if a.fieldStore != nil {
+		a.fieldStore.SetSelectedFields(fields)
+	}
+}
+
+// GetResourcesByKeys fetches resources from FieldStore by keys (Pull Model)
 // Called by frontend after receiving resource:update events
 func (a *App) GetResourcesByKeys(keys []string) []map[string]any {
 	result := make([]map[string]any, 0, len(keys))
+	if a.fieldStore == nil {
+		return result
+	}
+
 	for _, key := range keys {
-		if obj, ok := a.resourceCache.Load(key); ok {
-			if m, ok := obj.(map[string]any); ok {
-				result = append(result, m)
+		if obj := a.fieldStore.ReconstructObject(key); obj != nil {
+			// Extract context from key (format: "context/namespace/name")
+			parts := strings.SplitN(key, "/", 2)
+			if len(parts) > 0 {
+				obj["_context"] = parts[0]
 			}
+			result = append(result, obj)
 		}
 	}
 	return result
+}
+
+// GetAllResourceKeys returns all resource keys currently in the FieldStore.
+// Called by frontend after StartWatch to get initial batch of keys.
+// This is needed because trySend drops events when buffer is full during initial sync.
+func (a *App) GetAllResourceKeys() []string {
+	a.watchMu.RLock()
+	defer a.watchMu.RUnlock()
+
+	if a.fieldStore == nil {
+		return []string{}
+	}
+
+	return a.fieldStore.List()
 }
 
 // convertNodeTree converts kube.Node map to frontend TreeNode array

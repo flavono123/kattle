@@ -220,6 +220,16 @@ func CreateNodeTree(fieldTree map[string]*Field, objs []*unstructured.Unstructur
 	return result
 }
 
+// isNumericPath checks if a path segment is likely a numeric index.
+// This avoids calling strconv.Atoi and allocating error objects for non-numeric paths.
+func isNumericPath(path string) bool {
+	if len(path) == 0 {
+		return false
+	}
+	// Check if the first character is a digit
+	return path[0] >= '0' && path[0] <= '9'
+}
+
 func getNestedValue(obj map[string]interface{}, paths ...string) (interface{}, bool, error) {
 	var current interface{} = obj
 
@@ -234,8 +244,13 @@ func getNestedValue(obj map[string]interface{}, paths ...string) (interface{}, b
 			} else {
 				return nil, false, fmt.Errorf("expected array for wildcard, got %T", current)
 			}
-		} else if index, err := strconv.Atoi(path); err == nil {
-			// for array nodes
+		} else if isNumericPath(path) {
+			// for array nodes - only try parsing if path looks like a number
+			index, err := strconv.Atoi(path)
+			if err != nil {
+				// Shouldn't happen since we pre-checked, but handle gracefully
+				return nil, false, fmt.Errorf("invalid index: %s", path)
+			}
 			if slice, ok := current.([]interface{}); ok {
 				if index >= len(slice) {
 					return nil, false, fmt.Errorf("index %d out of bounds", index)
@@ -327,6 +342,224 @@ func getDistinctKeys(mapPath []string, objs []*unstructured.Unstructured) []stri
 	}
 
 	return keys
+}
+
+// pathToString converts a path slice to dot-separated string for FieldStore lookup
+func pathToString(path []string) string {
+	return strings.Join(path, ".")
+}
+
+// CreateNodeTreeFromStore creates a node tree using FieldStore's structure metadata.
+// This is memory-efficient as it doesn't require full Kubernetes objects.
+func CreateNodeTreeFromStore(fieldTree map[string]*Field, fs *FieldStore, nodePrefix []string) map[string]*Node {
+	result := make(map[string]*Node)
+
+	for key, field := range fieldTree {
+		prefix := field.Prefix
+		if !comparePrefix(nodePrefix, field.Prefix) {
+			prefix = nodePrefix
+		}
+
+		childPrefix := append(prefix, key)
+		children := map[string]*Node(nil)
+
+		if field.IsArray() {
+			maxLength := fs.GetMaxArrayLength(pathToString(childPrefix))
+			children = make(map[string]*Node)
+
+			// Add wildcard node for non-empty arrays (before creating index nodes)
+			if maxLength > 0 && field.Children != nil {
+				wildcardChildren := CreateNodeTreeFromStore(field.Children, fs, append(childPrefix, "*"))
+				children["*"] = &Node{
+					field:     nil,
+					name:      "*",
+					ancestors: childPrefix,
+					level:     field.Level + 1,
+					children:  wildcardChildren,
+				}
+			}
+
+			for i := 0; i < maxLength; i++ {
+				idx := strconv.Itoa(i)
+				grandChildren := map[string]*Node(nil)
+				if field.Children != nil {
+					grandChildren = CreateNodeTreeFromStore(field.Children, fs, append(childPrefix, idx))
+				}
+
+				children[idx] = &Node{
+					field:     nil,
+					name:      idx,
+					ancestors: childPrefix,
+					level:     field.Level + 1,
+					children:  grandChildren,
+				}
+			}
+		} else if field.IsMap() {
+			keys := fs.GetDistinctMapKeys(pathToString(childPrefix))
+			children = make(map[string]*Node)
+
+			// Add wildcard node for maps with keys (select all keys)
+			if len(keys) > 0 {
+				children["*"] = &Node{
+					field:     nil,
+					name:      "*",
+					ancestors: childPrefix,
+					level:     field.Level + 1,
+					children:  nil,
+				}
+			}
+
+			for _, mapKey := range keys {
+				grandChildren := map[string]*Node(nil)
+				if field.Children != nil {
+					grandChildren = CreateNodeTreeFromStore(field.Children, fs, append(childPrefix, mapKey))
+				}
+
+				children[mapKey] = &Node{
+					field:     nil,
+					name:      mapKey,
+					ancestors: childPrefix,
+					level:     field.Level + 1,
+					children:  grandChildren,
+				}
+			}
+
+		} else if field.IsObject() {
+			children = CreateNodeTreeFromStore(field.Children, fs, childPrefix)
+		}
+
+		result[key] = &Node{
+			field:     field,
+			ancestors: prefix,
+			name:      key,
+			children:  children,
+		}
+	}
+
+	return result
+}
+
+// UpdateNodeTreeFromStore updates a node tree using FieldStore's structure metadata.
+// Preserves Expanded/Selected state from existing nodes.
+func UpdateNodeTreeFromStore(existing map[string]*Node, fieldTree map[string]*Field, fs *FieldStore, nodePrefix []string) map[string]*Node {
+	result := make(map[string]*Node)
+
+	for key, field := range fieldTree {
+		prefix := field.Prefix
+		if !comparePrefix(nodePrefix, field.Prefix) {
+			prefix = nodePrefix
+		}
+
+		childPrefix := append(prefix, key)
+		var children map[string]*Node
+
+		existingNode, exists := existing[key]
+		expanded := exists && existingNode.Expanded
+		selected := exists && existingNode.Selected
+
+		if field.IsArray() {
+			maxLength := fs.GetMaxArrayLength(pathToString(childPrefix))
+			children = make(map[string]*Node)
+
+			// Add wildcard node for non-empty arrays
+			if maxLength > 0 && field.Children != nil {
+				existingWildcardChildren := map[string]*Node{}
+				if exists && existingNode.children != nil && existingNode.children["*"] != nil {
+					existingWildcardChildren = existingNode.children["*"].children
+				}
+				wildcardChildren := UpdateNodeTreeFromStore(existingWildcardChildren, field.Children, fs, append(childPrefix, "*"))
+				children["*"] = &Node{
+					field:     nil,
+					name:      "*",
+					ancestors: childPrefix,
+					level:     field.Level + 1,
+					children:  wildcardChildren,
+					Expanded:  exists && existingNode.children != nil && existingNode.children["*"] != nil && existingNode.children["*"].Expanded,
+					Selected:  exists && existingNode.children != nil && existingNode.children["*"] != nil && existingNode.children["*"].Selected,
+				}
+			}
+
+			for i := 0; i < maxLength; i++ {
+				idx := strconv.Itoa(i)
+				var grandChildren map[string]*Node
+
+				if field.Children != nil {
+					existingChildren := map[string]*Node{}
+					if exists && existingNode.children != nil && existingNode.children[idx] != nil {
+						existingChildren = existingNode.children[idx].children
+					}
+					grandChildren = UpdateNodeTreeFromStore(existingChildren, field.Children, fs, append(childPrefix, idx))
+				}
+
+				children[idx] = &Node{
+					field:     nil,
+					name:      idx,
+					ancestors: childPrefix,
+					level:     field.Level + 1,
+					children:  grandChildren,
+					Expanded:  exists && existingNode.children != nil && existingNode.children[idx] != nil && existingNode.children[idx].Expanded,
+					Selected:  exists && existingNode.children != nil && existingNode.children[idx] != nil && existingNode.children[idx].Selected,
+				}
+			}
+		} else if field.IsMap() {
+			keys := fs.GetDistinctMapKeys(pathToString(childPrefix))
+			children = make(map[string]*Node)
+
+			// Add wildcard node for maps with keys
+			if len(keys) > 0 {
+				children["*"] = &Node{
+					field:     nil,
+					name:      "*",
+					ancestors: childPrefix,
+					level:     field.Level + 1,
+					children:  nil,
+					Expanded:  exists && existingNode.children != nil && existingNode.children["*"] != nil && existingNode.children["*"].Expanded,
+					Selected:  exists && existingNode.children != nil && existingNode.children["*"] != nil && existingNode.children["*"].Selected,
+				}
+			}
+
+			for _, mapKey := range keys {
+				var grandChildren map[string]*Node
+
+				if field.Children != nil {
+					existingChildren := map[string]*Node{}
+					if exists && existingNode.children != nil {
+						if existingChild, ok := existingNode.children[mapKey]; ok {
+							existingChildren = existingChild.children
+						}
+					}
+					grandChildren = UpdateNodeTreeFromStore(existingChildren, field.Children, fs, append(childPrefix, mapKey))
+				}
+
+				children[mapKey] = &Node{
+					field:     nil,
+					name:      mapKey,
+					ancestors: childPrefix,
+					level:     field.Level + 1,
+					children:  grandChildren,
+					Expanded:  exists && existingNode.children != nil && existingNode.children[mapKey] != nil && existingNode.children[mapKey].Expanded,
+					Selected:  exists && existingNode.children != nil && existingNode.children[mapKey] != nil && existingNode.children[mapKey].Selected,
+				}
+			}
+		} else if field.IsObject() {
+			existingChildren := map[string]*Node{}
+			if exists {
+				existingChildren = existingNode.children
+			}
+			children = UpdateNodeTreeFromStore(existingChildren, field.Children, fs, childPrefix)
+		}
+
+		result[key] = &Node{
+			field:     field,
+			ancestors: prefix,
+			name:      key,
+			children:  children,
+			Expanded:  expanded,
+			Selected:  selected,
+		}
+	}
+
+	return result
 }
 
 // TODO: refactor, pull up traverse with create to function
