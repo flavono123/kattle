@@ -20,19 +20,23 @@ import (
 
 // Event metrics for debugging memory leaks
 var (
-	eventsEmitted atomic.Int64
-	eventsDropped atomic.Int64
+	eventsEmitted  atomic.Int64
+	eventsDropped  atomic.Int64
+	syncProcessed  atomic.Int64 // items processed via onSync callback during initial list
+	trySendCalled  atomic.Int64 // items that went through trySend (isInInitialList=false)
 )
 
-// GetEventMetrics returns the current event metrics (emitted, dropped)
-func GetEventMetrics() (emitted, dropped int64) {
-	return eventsEmitted.Load(), eventsDropped.Load()
+// GetEventMetrics returns the current event metrics (emitted, dropped, syncProcessed, trySendCalled)
+func GetEventMetrics() (emitted, dropped, synced, trySent int64) {
+	return eventsEmitted.Load(), eventsDropped.Load(), syncProcessed.Load(), trySendCalled.Load()
 }
 
 // ResetEventMetrics resets the event counters to zero
 func ResetEventMetrics() {
 	eventsEmitted.Store(0)
 	eventsDropped.Store(0)
+	syncProcessed.Store(0)
+	trySendCalled.Store(0)
 }
 
 // EventType represents the type of watch event
@@ -186,9 +190,11 @@ func (i *ResourceController) InformWithKeyOnlyStore(onSync SyncCallback) (chan s
 
 				if isInInitialList && onSync != nil {
 					// During initial sync: call callback synchronously (no race condition)
+					syncProcessed.Add(1)
 					onSync(EventAdded, u)
 				} else {
 					// After sync: emit via channel (may drop if buffer full)
+					trySendCalled.Add(1)
 					i.trySend(emitMsg{Type: EventAdded, Obj: u})
 				}
 
@@ -199,8 +205,10 @@ func (i *ResourceController) InformWithKeyOnlyStore(onSync SyncCallback) (chan s
 				i.nameCacheMu.Unlock()
 
 				if isInInitialList && onSync != nil {
+					syncProcessed.Add(1)
 					onSync(EventModified, u)
 				} else {
+					trySendCalled.Add(1)
 					i.trySend(emitMsg{Type: EventModified, Obj: u})
 				}
 
@@ -211,8 +219,10 @@ func (i *ResourceController) InformWithKeyOnlyStore(onSync SyncCallback) (chan s
 				i.nameCacheMu.Unlock()
 
 				if isInInitialList && onSync != nil {
+					syncProcessed.Add(1)
 					onSync(EventDeleted, u)
 				} else {
+					trySendCalled.Add(1)
 					i.trySend(emitMsg{Type: EventDeleted, Obj: u})
 				}
 			}

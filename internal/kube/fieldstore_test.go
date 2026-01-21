@@ -135,12 +135,14 @@ var _ = Describe("FieldStore", func() {
 	})
 
 	Describe("Field extraction", func() {
-		It("should extract all leaf values at full paths", func() {
+		It("should extract selected fields at full paths", func() {
 			key := "default/test-pod"
+			// Set selected fields before Update to extract non-essential fields
+			fs.SetSelectedFields([]string{"spec.nodeName", "status.phase"})
 			fs.Update(key, testObj)
 
 			fields := fs.Get(key)
-			// All leaf values are stored at their full path
+			// Selected leaf values are stored at their full path
 			Expect(fields["spec.nodeName"]).To(Equal("node-1"))
 			Expect(fields["status.phase"]).To(Equal("Running"))
 		})
@@ -339,6 +341,8 @@ var _ = Describe("FieldStore", func() {
 
 		It("should reconstruct arrays correctly", func() {
 			key := "default/test-pod"
+			// Set selected fields to extract container data
+			fs.SetSelectedFields([]string{"spec.containers"})
 			fs.Update(key, testObj)
 
 			obj := fs.ReconstructObject(key)
@@ -366,6 +370,8 @@ var _ = Describe("FieldStore", func() {
 
 		It("should reconstruct nested arrays correctly", func() {
 			key := "default/test-pod"
+			// Set selected fields to extract container data including ports
+			fs.SetSelectedFields([]string{"spec.containers"})
 			fs.Update(key, testObj)
 
 			obj := fs.ReconstructObject(key)
@@ -437,6 +443,65 @@ var _ = Describe("FieldStore", func() {
 			for i := 0; i < 10; i++ {
 				<-done
 			}
+		})
+	})
+
+	Context("String interning", func() {
+		It("should intern identical string values", func() {
+			// Create multiple pods with the same status.phase value
+			for i := 0; i < 100; i++ {
+				pod := &unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"metadata": map[string]interface{}{
+							"name":      "pod-" + string(rune('a'+i%26)),
+							"namespace": "default",
+						},
+						"status": map[string]interface{}{
+							"phase": "Running", // Same value across all pods
+						},
+					},
+				}
+				fs.SetSelectedFields([]string{"status.phase"})
+				fs.Update("default/pod-"+string(rune('a'+i%26)), pod)
+			}
+
+			// Verify all pods have the same interned value
+			var phaseValue interface{}
+			for i := 0; i < 26; i++ {
+				fields := fs.Get("default/pod-" + string(rune('a'+i)))
+				if fields == nil {
+					continue
+				}
+				if val, ok := fields["status.phase"]; ok {
+					if phaseValue == nil {
+						phaseValue = val
+					} else {
+						// All interned strings should be identical (same pointer)
+						Expect(val).To(Equal(phaseValue))
+					}
+				}
+			}
+		})
+
+		It("should not intern long strings (>64 chars)", func() {
+			longValue := "this-is-a-very-long-string-that-should-not-be-interned-because-it-exceeds-64-characters"
+			// Use labels instead of annotations (annotations removed from essential fields)
+			pod := &unstructured.Unstructured{
+				Object: map[string]interface{}{
+					"metadata": map[string]interface{}{
+						"name":      "test-pod",
+						"namespace": "default",
+						"labels": map[string]interface{}{
+							"long-label": longValue,
+						},
+					},
+				},
+			}
+			fs.Update("default/test-pod", pod)
+
+			fields := fs.Get("default/test-pod")
+			Expect(fields).NotTo(BeNil())
+			Expect(fields["metadata.labels.long-label"]).To(Equal(longValue))
 		})
 	})
 })

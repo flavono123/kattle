@@ -264,11 +264,17 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
   onPreviewClear,
   expandButton,
 }, ref) => {
+  // Convert selectedFields from string[][] to string[] (dot notation) for the hook
+  const selectedFieldPaths = useMemo(() => {
+    return selectedFields.map(field => field.join('.'));
+  }, [selectedFields]);
+
   // Use extracted hook for data fetching (watch enabled for real-time updates)
+  // Pass selectedFields so the backend extracts the correct field values
   const { data, loading, getRowId, changedCells } = useResourceData(
     selectedGVK,
     connectedContexts,
-    { watch: true }
+    { watch: true, selectedFields: selectedFieldPaths }
   );
 
   // Track flashing cells for real-time update visualization

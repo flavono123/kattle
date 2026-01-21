@@ -38,6 +38,6 @@ export function SaveFile(arg1:string,arg2:string):Promise<string>;
 
 export function SetSelectedFields(arg1:Array<string>):Promise<void>;
 
-export function StartWatch(arg1:main.MultiClusterGVK,arg2:Array<string>):Promise<void>;
+export function StartWatch(arg1:main.MultiClusterGVK,arg2:Array<string>,arg3:Array<string>):Promise<void>;
 
 export function StopWatch():Promise<void>;

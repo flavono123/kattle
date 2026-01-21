@@ -25,9 +25,17 @@ type FieldStore struct {
 
 	// essentialFields are always extracted (metadata)
 	essentialFields []string
+
+	// stringPool interns frequently repeated string values to reduce memory.
+	// e.g., status.phase = "Running" is stored once, referenced by all pods.
+	stringPool sync.Map // map[string]string
 }
 
 // Essential metadata fields that are always stored
+// NOTE: metadata.annotations is EXCLUDED to reduce memory usage.
+// Annotations like "kubectl.kubernetes.io/last-applied-configuration" can be
+// very large (entire pod spec as JSON). If specific annotations are needed,
+// users can select them in DFT - they'll be added to selectedFields.
 var defaultEssentialFields = []string{
 	"metadata.name",
 	"metadata.namespace",
@@ -35,7 +43,7 @@ var defaultEssentialFields = []string{
 	"metadata.resourceVersion",
 	"metadata.creationTimestamp",
 	"metadata.labels",
-	"metadata.annotations",
+	// "metadata.annotations", // REMOVED: causes WebView memory explosion (2GB+ for 6k pods)
 	"metadata.ownerReferences",
 	"metadata.deletionTimestamp",
 	"metadata.finalizers",
@@ -92,15 +100,30 @@ func (fs *FieldStore) List() []string {
 
 // Update extracts and stores field values from a full Kubernetes object.
 // The original object can be GC'd after this call.
-// Extracts: all leaf values (primitives), structure metadata (array lengths, map keys).
+// Extracts: structure metadata (always), essential fields, and selected fields.
+// If no selected fields are set, extracts all values (backward compatible).
 func (fs *FieldStore) Update(key string, obj *unstructured.Unstructured) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	fields := make(map[string]interface{})
 
-	// Extract ALL values (structure metadata + leaf values) with deep copy
-	extractAllValues(obj.Object, "", fields)
+	// Build extraction set: essential + selected fields
+	extractSet := make(map[string]struct{})
+	for _, f := range fs.essentialFields {
+		extractSet[f] = struct{}{}
+	}
+	for _, f := range fs.selectedFields {
+		extractSet[f] = struct{}{}
+	}
+
+	// If no fields specified, fall back to extracting all (backward compatible)
+	if len(extractSet) == 0 {
+		extractAllValues(obj.Object, "", fields, fs.internString)
+	} else {
+		// Extract structure metadata (always) + specified fields only
+		extractSelectiveValues(obj.Object, "", fields, extractSet, fs.internString)
+	}
 
 	fs.data[key] = fields
 }
@@ -146,6 +169,23 @@ func (fs *FieldStore) Count() int {
 	defer fs.mu.RUnlock()
 
 	return len(fs.data)
+}
+
+// internString returns a canonical string from the pool.
+// If the string is not in the pool, it's added and returned.
+// This reduces memory by sharing identical strings across resources.
+// Only interns short strings (<=64 chars) to avoid pool bloat from unique long values.
+func (fs *FieldStore) internString(s string) string {
+	// Don't intern very long strings (likely unique values like UIDs, timestamps)
+	if len(s) > 64 {
+		return s
+	}
+
+	if interned, ok := fs.stringPool.Load(s); ok {
+		return interned.(string)
+	}
+	fs.stringPool.Store(s, s)
+	return s
 }
 
 // GetMaxArrayLength returns the maximum array length at a given path across all resources.
@@ -364,7 +404,8 @@ func isNumericIndex(s string) bool {
 // - Structure metadata (_struct: prefix) for tree detection
 // - All primitive/leaf values (strings, numbers, bools) with deep copy
 // - Map keys and array lengths
-func extractAllValues(obj interface{}, prefix string, fields map[string]interface{}) {
+// intern is an optional function to intern repeated strings for memory efficiency.
+func extractAllValues(obj interface{}, prefix string, fields map[string]interface{}, intern func(string) string) {
 	switch v := obj.(type) {
 	case map[string]interface{}:
 		// Store map keys for this level (for tree detection)
@@ -382,7 +423,7 @@ func extractAllValues(obj interface{}, prefix string, fields map[string]interfac
 			if prefix != "" {
 				childPath = prefix + "." + k
 			}
-			extractAllValues(val, childPath, fields)
+			extractAllValues(val, childPath, fields, intern)
 		}
 
 	case []interface{}:
@@ -392,13 +433,90 @@ func extractAllValues(obj interface{}, prefix string, fields map[string]interfac
 		// Recurse into array elements with index in path
 		for i, elem := range v {
 			childPath := prefix + "." + strconv.Itoa(i)
-			extractAllValues(elem, childPath, fields)
+			extractAllValues(elem, childPath, fields, intern)
 		}
 
-	case string, bool, int, int64, float64, nil:
+	case string:
+		// Intern string values to reduce memory for repeated values
+		if prefix != "" {
+			fields[prefix] = intern(v)
+		}
+
+	case bool, int, int64, float64, nil:
 		// Store primitive values directly (these are already safe copies)
 		if prefix != "" {
 			fields[prefix] = v
 		}
 	}
+}
+
+// extractSelectiveValues extracts structure metadata (always) and selected field values only.
+// This significantly reduces memory usage by not storing unneeded leaf values.
+// Structure metadata (_struct:*) is always extracted for tree building.
+// Leaf values are only extracted if the path matches or is under a selected field.
+// intern is an optional function to intern repeated strings for memory efficiency.
+func extractSelectiveValues(obj interface{}, prefix string, fields map[string]interface{}, extractSet map[string]struct{}, intern func(string) string) {
+	switch v := obj.(type) {
+	case map[string]interface{}:
+		// Store map keys for this level (for tree detection) - ALWAYS
+		if prefix != "" {
+			keys := make([]string, 0, len(v))
+			for k := range v {
+				keys = append(keys, k)
+			}
+			fields["_struct:"+prefix+".keys"] = keys
+		}
+
+		// Recurse into children
+		for k, val := range v {
+			childPath := k
+			if prefix != "" {
+				childPath = prefix + "." + k
+			}
+			extractSelectiveValues(val, childPath, fields, extractSet, intern)
+		}
+
+	case []interface{}:
+		// Store array length - ALWAYS
+		fields["_struct:"+prefix+".len"] = len(v)
+
+		// Recurse into array elements with index in path
+		for i, elem := range v {
+			childPath := prefix + "." + strconv.Itoa(i)
+			extractSelectiveValues(elem, childPath, fields, extractSet, intern)
+		}
+
+	case string:
+		// Store string values ONLY if path should be extracted, intern for memory efficiency
+		if prefix != "" && shouldExtractPath(prefix, extractSet) {
+			fields[prefix] = intern(v)
+		}
+
+	case bool, int, int64, float64, nil:
+		// Store primitive values ONLY if path should be extracted
+		if prefix != "" && shouldExtractPath(prefix, extractSet) {
+			fields[prefix] = v
+		}
+	}
+}
+
+// shouldExtractPath checks if a path should have its value extracted.
+// Returns true if:
+// 1. Exact match: path is in extractSet
+// 2. Child of selected: a prefix of path is in extractSet (e.g., "metadata.labels.app" when "metadata.labels" is selected)
+func shouldExtractPath(path string, extractSet map[string]struct{}) bool {
+	// Exact match
+	if _, ok := extractSet[path]; ok {
+		return true
+	}
+
+	// Check if any selected field is a prefix of this path
+	// e.g., if "metadata.labels" is selected, extract "metadata.labels.app"
+	for selected := range extractSet {
+		if strings.HasPrefix(path, selected+".") {
+			return true
+		}
+	}
+
+	return false
 }

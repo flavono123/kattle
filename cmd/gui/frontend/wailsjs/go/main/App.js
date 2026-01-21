@@ -74,8 +74,8 @@ export function SetSelectedFields(arg1) {
   return window['go']['main']['App']['SetSelectedFields'](arg1);
 }
 
-export function StartWatch(arg1, arg2) {
-  return window['go']['main']['App']['StartWatch'](arg1, arg2);
+export function StartWatch(arg1, arg2, arg3) {
+  return window['go']['main']['App']['StartWatch'](arg1, arg2, arg3);
 }
 
 export function StopWatch() {
