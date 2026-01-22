@@ -114,16 +114,14 @@ export function useResourceData(
     const watchGen = ++watchGenRef.current;
     setError(null);
 
-    // Only clear data if GVK or contexts changed, NOT when only selectedFields changes
-    // This preserves existing data during field selection changes
+    // Always show loading when starting a new watch - this is critical for React Strict Mode
+    // where the effect runs twice but only the first run clears data
+    setLoading(true);
+
+    // Only clear data if GVK or contexts changed
     if (shouldClearData) {
       console.log('useResourceData: clearing data (GVK or contexts changed)');
       setData([]);
-      setLoading(true);
-    } else {
-      // When only selectedFields changes, don't show loading since data is already visible
-      // The batch processor will update data incrementally
-      console.log('useResourceData: preserving data (only selectedFields changed)');
     }
 
     setWatchStatus('connecting');
@@ -132,9 +130,6 @@ export function useResourceData(
     // Always reset these flags when starting a new watch - flush will set loading=false after first batch
     hasReceivedFirstBatch.current = false;
     hasReceivedAnyEvent.current = false;
-
-    // Initial sync timeout - if no data arrives within this time, assume sync is complete
-    let initialSyncTimeout: ReturnType<typeof setTimeout> | null = null;
 
     // Chain the start operation to ensure previous stop completes first
     const startOperation = watchOperationRef.current
@@ -149,16 +144,9 @@ export function useResourceData(
         // Initial sync happens in background - wait for sync:complete event.
         console.log(`useResourceData: watch setup complete for ${gvk.kind}, waiting for sync:complete`);
         setWatchStatus('connected');
-
-        // Set a longer timeout for truly empty resources (no sync:complete within 5s)
-        initialSyncTimeout = setTimeout(() => {
-          if (watchGen !== watchGenRef.current) return;
-          if (!hasReceivedFirstBatch.current && !hasReceivedAnyEvent.current) {
-            console.log(`useResourceData: sync timeout for ${gvk.kind}, assuming 0 resources`);
-            setLoading(false);
-            hasReceivedFirstBatch.current = true;
-          }
-        }, 5000);
+        // No timeout - loading state is managed by:
+        // 1. flush() after first batch of data
+        // 2. sync:complete with count=0 for empty resources
       })
       .catch((err) => {
         if (watchGen !== watchGenRef.current) return;
@@ -207,12 +195,6 @@ export function useResourceData(
       console.log(`useResourceData: sync:complete received with ${data.count} items for ${gvk.kind}`);
       hasReceivedAnyEvent.current = true;
 
-      // Clear the timeout since sync completed
-      if (initialSyncTimeout) {
-        clearTimeout(initialSyncTimeout);
-        initialSyncTimeout = null;
-      }
-
       // Fetch final keys after sync complete
       try {
         const allKeys = await GetAllResourceKeys();
@@ -251,12 +233,9 @@ export function useResourceData(
       }
     });
 
-    // Cleanup - only clear timeout and unsubscribe
+    // Cleanup - unsubscribe event listeners
     // StopWatch is called in the chained operation to avoid race conditions
     return () => {
-      if (initialSyncTimeout) {
-        clearTimeout(initialSyncTimeout);
-      }
       unsubscribeSyncProgress();
       unsubscribeSyncComplete();
       unsubscribeResourceUpdate();
