@@ -161,8 +161,10 @@ var _ = Describe("FieldStore", func() {
 	})
 
 	Describe("Structure metadata extraction", func() {
-		It("should extract array lengths", func() {
+		It("should extract array lengths for selected fields", func() {
 			key := "default/test-pod"
+			// Set selected fields to include spec.containers so structure metadata is extracted
+			fs.SetSelectedFields([]string{"spec.containers"})
 			fs.Update(key, testObj)
 
 			fields := fs.Get(key)
@@ -170,15 +172,32 @@ var _ = Describe("FieldStore", func() {
 			Expect(fields["_struct:spec.containers.len"]).To(Equal(2))
 		})
 
-		It("should extract map keys", func() {
+		It("should extract map keys for selected fields", func() {
 			key := "default/test-pod"
+			// Set selected fields to include spec.* so structure metadata for spec is extracted
+			fs.SetSelectedFields([]string{"spec.containers", "spec.nodeName"})
 			fs.Update(key, testObj)
 
 			fields := fs.Get(key)
-			// metadata level should have keys
+			// spec level should have keys since it's an ancestor of selected fields
 			specKeys, ok := fields["_struct:spec.keys"].([]string)
 			Expect(ok).To(BeTrue())
 			Expect(specKeys).To(ContainElements("containers", "nodeName"))
+		})
+
+		It("should NOT extract structure metadata for non-selected paths", func() {
+			key := "default/test-pod"
+			// Only essential fields are selected (metadata.*)
+			// spec.* is not selected, so its structure metadata should NOT be stored
+			fs.Update(key, testObj)
+
+			fields := fs.Get(key)
+			// spec.containers structure metadata should NOT exist
+			_, hasSpecContainersLen := fields["_struct:spec.containers.len"]
+			Expect(hasSpecContainersLen).To(BeFalse())
+			// But metadata structure should exist (essential fields)
+			_, hasMetadataKeys := fields["_struct:metadata.keys"]
+			Expect(hasMetadataKeys).To(BeTrue())
 		})
 	})
 
@@ -232,6 +251,9 @@ var _ = Describe("FieldStore", func() {
 
 	Describe("GetMaxArrayLength", func() {
 		It("should return max array length across all resources", func() {
+			// Set selected fields to include spec.containers so structure metadata is extracted
+			fs.SetSelectedFields([]string{"spec.containers"})
+
 			// Create objects with different container counts
 			pod1 := &unstructured.Unstructured{
 				Object: map[string]interface{}{
@@ -268,6 +290,8 @@ var _ = Describe("FieldStore", func() {
 		})
 
 		It("should return 0 for non-existent path", func() {
+			// Set selected fields to include spec.containers to store some structure metadata
+			fs.SetSelectedFields([]string{"spec.containers"})
 			fs.Update("default/test-pod", testObj)
 
 			maxLen := fs.GetMaxArrayLength("spec.nonexistent")

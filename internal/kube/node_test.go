@@ -73,6 +73,9 @@ var _ = Describe("Node", func() {
 		})
 
 		It("should create nodes for array fields using FieldStore", func() {
+			// Set selected fields to include spec.containers so structure metadata is extracted
+			fs.SetSelectedFields([]string{"spec.containers"})
+
 			// Create a pod with containers array
 			pod := &unstructured.Unstructured{
 				Object: map[string]interface{}{

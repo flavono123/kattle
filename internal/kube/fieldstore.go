@@ -532,16 +532,17 @@ func extractAllValues(obj interface{}, prefix string, fields map[string]interfac
 	}
 }
 
-// extractSelectiveValues extracts structure metadata (always) and selected field values only.
+// extractSelectiveValues extracts structure metadata and selected field values only.
 // This significantly reduces memory usage by not storing unneeded leaf values.
-// Structure metadata (_struct:*) is always extracted for tree building.
+// Structure metadata (_struct:*) is only extracted for paths that are on the way to
+// or under selected fields, preventing memory explosion from deeply nested structures.
 // Leaf values are only extracted if the path matches or is under a selected field.
 // intern is an optional function to intern repeated strings for memory efficiency.
 func extractSelectiveValues(obj interface{}, prefix string, fields map[string]interface{}, extractSet map[string]struct{}, intern func(string) string) {
 	switch v := obj.(type) {
 	case map[string]interface{}:
-		// Store map keys for this level (for tree detection) - ALWAYS
-		if prefix != "" {
+		// Store map keys only if this path is relevant to extractSet
+		if prefix != "" && isUnderExtractPath(prefix, extractSet) {
 			keys := make([]string, 0, len(v))
 			for k := range v {
 				keys = append(keys, k)
@@ -559,8 +560,10 @@ func extractSelectiveValues(obj interface{}, prefix string, fields map[string]in
 		}
 
 	case []interface{}:
-		// Store array length - ALWAYS
-		fields["_struct:"+prefix+".len"] = len(v)
+		// Store array length only if this path is relevant to extractSet
+		if isUnderExtractPath(prefix, extractSet) {
+			fields["_struct:"+prefix+".len"] = len(v)
+		}
 
 		// Recurse into array elements with index in path
 		for i, elem := range v {
@@ -595,6 +598,37 @@ func shouldExtractPath(path string, extractSet map[string]struct{}) bool {
 	// Check if any selected field is a prefix of this path
 	// e.g., if "metadata.labels" is selected, extract "metadata.labels.app"
 	for selected := range extractSet {
+		if strings.HasPrefix(path, selected+".") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isUnderExtractPath checks if a path is relevant for structure metadata storage.
+// Returns true if:
+// 1. Exact match: path is in extractSet
+// 2. Ancestor: path is a prefix of any extractSet entry (need to traverse through this path)
+// 3. Descendant: any extractSet entry is a prefix of path (we're under a selected field)
+//
+// This limits structure metadata (_struct:*.keys, _struct:*.len) to only paths
+// that are on the way to or under selected fields, preventing memory explosion
+// from deeply nested structures like spec.containers[].env[].
+func isUnderExtractPath(path string, extractSet map[string]struct{}) bool {
+	// Exact match
+	if _, ok := extractSet[path]; ok {
+		return true
+	}
+
+	pathWithDot := path + "."
+
+	for selected := range extractSet {
+		// Check if path is an ancestor of selected (e.g., path="spec" and selected="spec.nodeName")
+		if strings.HasPrefix(selected, pathWithDot) {
+			return true
+		}
+		// Check if path is a descendant of selected (e.g., path="metadata.labels.app" and selected="metadata.labels")
 		if strings.HasPrefix(path, selected+".") {
 			return true
 		}
