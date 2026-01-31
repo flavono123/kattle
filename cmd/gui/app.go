@@ -365,11 +365,14 @@ func (a *App) GetResources(gvk MultiClusterGVK, contexts []string) ([]map[string
 	return result, nil
 }
 
-// ResourceEventMeta represents a lightweight watch event (Pull Model)
-// Only contains metadata - frontend fetches full object via GetResources()
+// ResourceEventMeta represents a watch event with optional delta data.
+// For ADDED/MODIFIED: includes Fields (reconstructed object) for direct frontend update.
+// For DELETED: Fields is omitted.
+// This eliminates the need for frontend to call GetResourcesByKeys for real-time updates.
 type ResourceEventMeta struct {
-	Type string `json:"type"` // "ADDED", "MODIFIED", "DELETED"
-	Key  string `json:"key"`  // "context/namespace/name" unique identifier
+	Type   string                 `json:"type"`             // "ADDED", "MODIFIED", "DELETED"
+	Key    string                 `json:"key"`              // "context/namespace/name" unique identifier
+	Fields map[string]interface{} `json:"fields,omitempty"` // Reconstructed object (only for ADDED/MODIFIED)
 }
 
 // makeResourceKey creates a unique cache key for a resource
@@ -523,16 +526,37 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 							continue
 						}
 
-						if string(event.Type) == "DELETED" {
-							currentFs.Delete(key)
-						} else {
-							currentFs.Update(key, event.Obj)
-						}
-
-						runtime.EventsEmit(a.ctx, "resource:update", ResourceEventMeta{
+						eventMeta := ResourceEventMeta{
 							Type: string(event.Type),
 							Key:  key,
-						})
+						}
+
+						if string(event.Type) == "DELETED" {
+							currentFs.Delete(key)
+							// No fields for DELETED events
+						} else {
+							// Update FieldStore first
+							currentFs.Update(key, event.Obj)
+
+							// Include reconstructed object in event (delta update)
+							// This eliminates the need for frontend to call GetResourcesByKeys
+							if cachedFields := currentFs.ReconstructObject(key); cachedFields != nil {
+								// Make a shallow copy since ReconstructObject returns cached object
+								// that should not be modified
+								fields := make(map[string]interface{}, len(cachedFields)+1)
+								for k, v := range cachedFields {
+									fields[k] = v
+								}
+								// Extract context from key (format: "context/namespace/name")
+								parts := strings.SplitN(key, "/", 2)
+								if len(parts) > 0 {
+									fields["_context"] = parts[0]
+								}
+								eventMeta.Fields = fields
+							}
+						}
+
+						runtime.EventsEmit(a.ctx, "resource:update", eventMeta)
 					case <-ctrl.Done():
 						return
 					}

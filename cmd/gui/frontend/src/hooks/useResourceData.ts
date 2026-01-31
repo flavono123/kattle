@@ -71,8 +71,11 @@ export function useResourceData(
   const prevGvkRef = useRef<main.MultiClusterGVK | null>(null);
   const prevContextsKeyRef = useRef<string>('');
 
-  // Pending keys for ADDED/MODIFIED events (Pull Model)
+  // Pending keys for ADDED/MODIFIED events (Pull Model - fallback when no fields in event)
   const pendingKeys = useRef<Set<string>>(new Set());
+
+  // Pending delta updates - resources with fields included in event (no GetResourcesByKeys needed)
+  const pendingDeltaUpdates = useRef<Map<string, Record<string, unknown>>>(new Map());
 
   // Pending deletes - keys to remove
   const pendingDeletes = useRef<Set<string>>(new Set());
@@ -126,6 +129,7 @@ export function useResourceData(
 
     setWatchStatus('connecting');
     pendingKeys.current.clear();
+    pendingDeltaUpdates.current.clear();
     pendingDeletes.current.clear();
     // Always reset these flags when starting a new watch - flush will set loading=false after first batch
     hasReceivedFirstBatch.current = false;
@@ -216,7 +220,8 @@ export function useResourceData(
       }
     });
 
-    // Subscribe to lightweight events (Pull Model) for real-time updates
+    // Subscribe to events for real-time updates (Delta Update Model)
+    // If event includes fields, apply directly without GetResourcesByKeys call
     const unsubscribeResourceUpdate = EventsOn('resource:update', (event: ResourceEventMeta) => {
       if (watchGen !== watchGenRef.current) return;
 
@@ -226,9 +231,14 @@ export function useResourceData(
       if (event.type === 'DELETED') {
         // Collect deletes separately
         pendingDeletes.current.add(event.key);
-        pendingKeys.current.delete(event.key); // No need to fetch deleted resources
+        pendingKeys.current.delete(event.key);
+        pendingDeltaUpdates.current.delete(event.key);
+      } else if (event.fields) {
+        // Delta update: fields included in event, no GetResourcesByKeys needed
+        pendingDeltaUpdates.current.set(event.key, event.fields);
+        pendingKeys.current.delete(event.key); // Remove from fallback queue
       } else {
-        // ADDED or MODIFIED - collect key for batch fetch
+        // Fallback: no fields, need to fetch via GetResourcesByKeys
         pendingKeys.current.add(event.key);
       }
     });
@@ -304,8 +314,9 @@ export function useResourceData(
       });
   }, [watch, gvk, watchStatus, selectedFieldsKey, selectedFields]);
 
-  // Batch processor: fetch resources and apply updates (Pull Model)
-  // Chunk size for fetching resources - prevents overwhelming the system with large batches
+  // Batch processor: apply delta updates and fetch remaining resources
+  // Delta updates (with fields in event) are applied directly without GetResourcesByKeys
+  // Fallback keys (no fields) are fetched via GetResourcesByKeys
   const FETCH_CHUNK_SIZE = 500;
 
   useEffect(() => {
@@ -321,14 +332,18 @@ export function useResourceData(
         return;
       }
 
-      // Take only a chunk of pending keys to avoid overwhelming the system
+      // Collect delta updates (resources with fields from events - no fetch needed)
+      const deltaUpdates = new Map(pendingDeltaUpdates.current);
+      pendingDeltaUpdates.current.clear();
+
+      // Take only a chunk of fallback keys to avoid overwhelming the system
       const allPendingKeys = Array.from(pendingKeys.current);
       const keysToFetch = allPendingKeys.slice(0, FETCH_CHUNK_SIZE);
       const keysToDelete = Array.from(pendingDeletes.current);
 
-      // Debug log to see if flush is being called with keys
-      if (allPendingKeys.length > 0 || keysToDelete.length > 0) {
-        console.log(`useResourceData flush: pending=${allPendingKeys.length}, toFetch=${keysToFetch.length}, toDelete=${keysToDelete.length}`);
+      // Debug log to see if flush is being called with data
+      if (deltaUpdates.size > 0 || allPendingKeys.length > 0 || keysToDelete.length > 0) {
+        console.log(`useResourceData flush: delta=${deltaUpdates.size}, fallback=${allPendingKeys.length}, toFetch=${keysToFetch.length}, toDelete=${keysToDelete.length}`);
       }
 
       // Remove fetched keys from pending (keep remaining for next batch)
@@ -338,17 +353,17 @@ export function useResourceData(
       pendingDeletes.current.clear();
 
       // Nothing to do
-      if (keysToFetch.length === 0 && keysToDelete.length === 0) {
+      if (deltaUpdates.size === 0 && keysToFetch.length === 0 && keysToDelete.length === 0) {
         return;
       }
 
       // Log progress for large batches
       if (allPendingKeys.length > FETCH_CHUNK_SIZE) {
-        console.log(`useResourceData: fetching chunk ${keysToFetch.length}/${allPendingKeys.length} keys`);
+        console.log(`useResourceData: fetching chunk ${keysToFetch.length}/${allPendingKeys.length} fallback keys`);
       }
 
-      // Fetch resources for ADDED/MODIFIED keys
-      let fetchedResources: any[] = [];
+      // Fetch resources for fallback keys (no fields in event)
+      let fetchedResources: Record<string, unknown>[] = [];
       if (keysToFetch.length > 0) {
         try {
           fetchedResources = await GetResourcesByKeys(keysToFetch);
@@ -374,7 +389,22 @@ export function useResourceData(
           dataMap.delete(key);
         }
 
-        // Apply fetched resources (ADDED/MODIFIED)
+        // Apply delta updates (ADDED/MODIFIED with fields from events - no fetch needed)
+        for (const [key, resource] of deltaUpdates) {
+          const prevResource = dataMap.get(key);
+
+          // Track changes for MODIFIED
+          if (prevResource) {
+            const changedPaths = diffFields(prevResource, resource);
+            for (const columnId of changedPaths) {
+              changes.push({ rowId: key, columnId, timestamp: now });
+            }
+          }
+
+          dataMap.set(key, resource);
+        }
+
+        // Apply fetched resources (fallback ADDED/MODIFIED)
         for (const resource of fetchedResources) {
           const rowId = getResourceKey(resource);
           const prevResource = dataMap.get(rowId);
@@ -418,6 +448,7 @@ export function useResourceData(
     setError(null);
     setData([]);
     pendingKeys.current.clear();
+    pendingDeltaUpdates.current.clear();
     pendingDeletes.current.clear();
     hasReceivedFirstBatch.current = false;
     hasReceivedAnyEvent.current = false;

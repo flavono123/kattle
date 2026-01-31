@@ -1,6 +1,8 @@
 package kube
 
 import (
+	"reflect"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -337,6 +339,94 @@ var _ = Describe("FieldStore", func() {
 			Expect(ok).To(BeTrue())
 			Expect(metadata["name"]).To(Equal("test-pod"))
 			Expect(metadata["namespace"]).To(Equal("default"))
+		})
+
+		It("should cache reconstructed objects for subsequent calls", func() {
+			key := "default/test-pod"
+			fs.Update(key, testObj)
+
+			// First call builds and caches
+			obj1 := fs.ReconstructObject(key)
+			Expect(obj1).NotTo(BeNil())
+
+			// Second call should return the same cached object (same pointer)
+			obj2 := fs.ReconstructObject(key)
+			Expect(obj2).NotTo(BeNil())
+
+			// Verify it's the same object (pointer equality via reflect)
+			// Maps cannot be compared directly in Go, so we use reflect.ValueOf().Pointer()
+			ptr1 := reflect.ValueOf(obj1).Pointer()
+			ptr2 := reflect.ValueOf(obj2).Pointer()
+			Expect(ptr1).To(Equal(ptr2), "Expected same pointer for cached objects")
+		})
+
+		It("should invalidate cache on Update", func() {
+			key := "default/test-pod"
+			fs.Update(key, testObj)
+
+			// Get cached object
+			obj1 := fs.ReconstructObject(key)
+			Expect(obj1).NotTo(BeNil())
+
+			// Update the resource (invalidates cache)
+			updatedObj := &unstructured.Unstructured{
+				Object: map[string]interface{}{
+					"metadata": map[string]interface{}{
+						"name":      "test-pod-updated",
+						"namespace": "default",
+					},
+				},
+			}
+			fs.Update(key, updatedObj)
+
+			// Get new object (should be rebuilt)
+			obj2 := fs.ReconstructObject(key)
+			Expect(obj2).NotTo(BeNil())
+
+			// Should be a different object with updated data
+			metadata, ok := obj2["metadata"].(map[string]interface{})
+			Expect(ok).To(BeTrue())
+			Expect(metadata["name"]).To(Equal("test-pod-updated"))
+
+			// Original cached object should still have old data
+			oldMetadata, ok := obj1["metadata"].(map[string]interface{})
+			Expect(ok).To(BeTrue())
+			Expect(oldMetadata["name"]).To(Equal("test-pod"))
+		})
+
+		It("should invalidate cache on Delete", func() {
+			key := "default/test-pod"
+			fs.Update(key, testObj)
+
+			// Get cached object
+			obj1 := fs.ReconstructObject(key)
+			Expect(obj1).NotTo(BeNil())
+
+			// Delete the resource (invalidates cache)
+			fs.Delete(key)
+
+			// Should return nil now
+			obj2 := fs.ReconstructObject(key)
+			Expect(obj2).To(BeNil())
+		})
+
+		It("should invalidate all caches on Clear", func() {
+			// Add multiple resources
+			fs.Update("default/pod-1", testObj)
+			fs.Update("default/pod-2", testObj)
+
+			// Cache both
+			obj1 := fs.ReconstructObject("default/pod-1")
+			obj2 := fs.ReconstructObject("default/pod-2")
+			Expect(obj1).NotTo(BeNil())
+			Expect(obj2).NotTo(BeNil())
+
+			// Clear all
+			fs.Clear()
+
+			// Both should return nil now
+			Expect(fs.ReconstructObject("default/pod-1")).To(BeNil())
+			Expect(fs.ReconstructObject("default/pod-2")).To(BeNil())
 		})
 
 		It("should reconstruct arrays correctly", func() {

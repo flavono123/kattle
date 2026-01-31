@@ -29,6 +29,12 @@ type FieldStore struct {
 	// stringPool interns frequently repeated string values to reduce memory.
 	// e.g., status.phase = "Running" is stored once, referenced by all pods.
 	stringPool sync.Map // map[string]string
+
+	// reconstructedCache caches reconstructed objects to avoid repeated allocations.
+	// Key: resource key, Value: reconstructed map[string]interface{}
+	// Invalidated on Update/Delete. Thread-safe via sync.Map.
+	// NOTE: Cached objects are shared across callers - do not modify returned values.
+	reconstructedCache sync.Map // map[string]map[string]interface{}
 }
 
 // Essential metadata fields that are always stored
@@ -102,7 +108,11 @@ func (fs *FieldStore) List() []string {
 // The original object can be GC'd after this call.
 // Extracts: structure metadata (always), essential fields, and selected fields.
 // If no selected fields are set, extracts all values (backward compatible).
+// Invalidates any cached reconstruction for this key.
 func (fs *FieldStore) Update(key string, obj *unstructured.Unstructured) {
+	// Invalidate cache first (lock-free via sync.Map)
+	fs.reconstructedCache.Delete(key)
+
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -128,16 +138,24 @@ func (fs *FieldStore) Update(key string, obj *unstructured.Unstructured) {
 	fs.data[key] = fields
 }
 
-// Delete removes a resource from the store
+// Delete removes a resource from the store.
+// Invalidates any cached reconstruction for this key.
 func (fs *FieldStore) Delete(key string) {
+	// Invalidate cache first (lock-free via sync.Map)
+	fs.reconstructedCache.Delete(key)
+
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	delete(fs.data, key)
 }
 
-// Clear removes all resources from the store
+// Clear removes all resources from the store.
+// Also clears the reconstruction cache.
 func (fs *FieldStore) Clear() {
+	// Clear cache first (replace with new empty sync.Map)
+	fs.reconstructedCache = sync.Map{}
+
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -271,17 +289,33 @@ func (fs *FieldStore) DetectStructureChange(oldFields, newFields map[string]inte
 // ReconstructObject rebuilds a partial object from stored fields.
 // Used for GetResourcesByKeys to return data to frontend.
 // Note: This returns only stored fields, not the full original object.
+//
+// Performance: Results are cached and reused until Update/Delete is called.
+// WARNING: The returned map is shared across callers - do not modify it.
 func (fs *FieldStore) ReconstructObject(key string) map[string]interface{} {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	// Fast path: check cache first (lock-free via sync.Map)
+	if cached, ok := fs.reconstructedCache.Load(key); ok {
+		return cached.(map[string]interface{})
+	}
 
+	fs.mu.RLock()
 	fields, ok := fs.data[key]
 	if !ok {
+		fs.mu.RUnlock()
 		return nil
 	}
 
+	// Count non-structure fields to estimate map capacity
+	fieldCount := 0
+	for path := range fields {
+		if !strings.HasPrefix(path, "_struct:") {
+			fieldCount++
+		}
+	}
+
 	// Build a nested object from flat field paths
-	obj := make(map[string]interface{})
+	// Pre-allocate with estimated capacity (top-level keys ~10-20% of total fields)
+	obj := make(map[string]interface{}, fieldCount/5+4)
 
 	for path, value := range fields {
 		// Skip structure metadata (not part of the actual object)
@@ -290,8 +324,12 @@ func (fs *FieldStore) ReconstructObject(key string) map[string]interface{} {
 		}
 		setFieldByPath(obj, path, value)
 	}
+	fs.mu.RUnlock()
 
-	return obj
+	// Cache the result for subsequent calls
+	// Use LoadOrStore to handle concurrent reconstruction attempts
+	actual, _ := fs.reconstructedCache.LoadOrStore(key, obj)
+	return actual.(map[string]interface{})
 }
 
 // getFieldByPath retrieves a value from a nested map using dot notation.
@@ -316,17 +354,53 @@ func getFieldByPath(obj map[string]interface{}, path string) (interface{}, bool)
 	return current, true
 }
 
+// pathPartsPool reduces allocations for path splitting in setFieldByPath.
+// Each []string slice is reused for parsing dot-separated paths.
+var pathPartsPool = sync.Pool{
+	New: func() interface{} {
+		// Pre-allocate for typical path depth (e.g., "spec.containers.0.ports.0.containerPort")
+		parts := make([]string, 0, 8)
+		return &parts
+	},
+}
+
 // setFieldByPath sets a value in a nested structure using dot notation.
 // Handles both maps and arrays - numeric path segments create array indices.
 func setFieldByPath(obj map[string]interface{}, path string, value interface{}) {
-	parts := strings.Split(path, ".")
-	if len(parts) == 0 {
+	if path == "" {
 		return
 	}
+
+	// Get a slice from the pool and split path into it
+	partsPtr := pathPartsPool.Get().(*[]string)
+	parts := (*partsPtr)[:0] // Reset length, keep capacity
+
+	// Manual split to avoid allocation from strings.Split
+	start := 0
+	for i := 0; i <= len(path); i++ {
+		if i == len(path) || path[i] == '.' {
+			if i > start {
+				parts = append(parts, path[start:i])
+			}
+			start = i + 1
+		}
+	}
+
+	if len(parts) == 0 {
+		*partsPtr = parts
+		pathPartsPool.Put(partsPtr)
+		return
+	}
+
 	setNestedValue(obj, parts, value)
+
+	// Return to pool
+	*partsPtr = parts
+	pathPartsPool.Put(partsPtr)
 }
 
 // setNestedValue recursively sets a value in a nested map/array structure.
+// Optimized to minimize allocations by pre-sizing maps and arrays.
 func setNestedValue(current map[string]interface{}, parts []string, value interface{}) {
 	for i := 0; i < len(parts); i++ {
 		part := parts[i]
@@ -342,24 +416,21 @@ func setNestedValue(current map[string]interface{}, parts []string, value interf
 
 		if isNumericIndex(nextPart) {
 			// Next part is array index, ensure current[part] is an array
-			arr := ensureArray(current, part)
 			idx, _ := strconv.Atoi(nextPart)
 
-			// Ensure array has enough elements
-			for len(arr) <= idx {
-				arr = append(arr, nil)
-			}
-			current[part] = arr // Update in case append reallocated
+			// Get or create array with sufficient capacity
+			arr := ensureArrayWithCapacity(current, part, idx+1)
 
 			// Check if we're setting a leaf value or nested structure
 			if i+2 < len(parts) {
 				// More path segments after index - ensure element is a map
 				if arr[idx] == nil {
-					arr[idx] = make(map[string]interface{})
+					// Pre-allocate with small capacity for nested object
+					arr[idx] = make(map[string]interface{}, 4)
 				}
 				elemMap, ok := arr[idx].(map[string]interface{})
 				if !ok {
-					elemMap = make(map[string]interface{})
+					elemMap = make(map[string]interface{}, 4)
 					arr[idx] = elemMap
 				}
 				current = elemMap
@@ -372,11 +443,12 @@ func setNestedValue(current map[string]interface{}, parts []string, value interf
 		} else {
 			// Next part is a key, ensure current[part] is a map
 			if current[part] == nil {
-				current[part] = make(map[string]interface{})
+				// Pre-allocate with small capacity for nested object
+				current[part] = make(map[string]interface{}, 4)
 			}
 			nextMap, ok := current[part].(map[string]interface{})
 			if !ok {
-				nextMap = make(map[string]interface{})
+				nextMap = make(map[string]interface{}, 4)
 				current[part] = nextMap
 			}
 			current = nextMap
@@ -384,12 +456,22 @@ func setNestedValue(current map[string]interface{}, parts []string, value interf
 	}
 }
 
-// ensureArray ensures the value at key is a slice, creating one if needed.
-func ensureArray(m map[string]interface{}, key string) []interface{} {
+// ensureArrayWithCapacity ensures the value at key is a slice with at least minLen elements.
+// Creates or extends the array as needed, minimizing reallocations.
+func ensureArrayWithCapacity(m map[string]interface{}, key string, minLen int) []interface{} {
 	if arr, ok := m[key].([]interface{}); ok {
+		// Extend if needed
+		if len(arr) < minLen {
+			// Grow to exact size needed (we know the final size)
+			for len(arr) < minLen {
+				arr = append(arr, nil)
+			}
+			m[key] = arr
+		}
 		return arr
 	}
-	arr := make([]interface{}, 0)
+	// Create new array with exact capacity needed
+	arr := make([]interface{}, minLen)
 	m[key] = arr
 	return arr
 }
