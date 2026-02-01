@@ -20,10 +20,10 @@ import (
 
 // Event metrics for debugging memory leaks
 var (
-	eventsEmitted  atomic.Int64
-	eventsDropped  atomic.Int64
-	syncProcessed  atomic.Int64 // items processed via onSync callback during initial list
-	trySendCalled  atomic.Int64 // items that went through trySend (isInInitialList=false)
+	eventsEmitted atomic.Int64
+	eventsDropped atomic.Int64
+	syncProcessed atomic.Int64 // items processed via onSync callback during initial list
+	trySendCalled atomic.Int64 // items that went through trySend (isInInitialList=false)
 )
 
 // GetEventMetrics returns the current event metrics (emitted, dropped, syncProcessed, trySendCalled)
@@ -61,8 +61,8 @@ type ResourceController struct {
 	contextName string // optional, for GUI multi-context support
 	client      dynamic.Interface
 	gvr         schema.GroupVersionResource
-	store       cache.Store       // may be KeyOnlyStore (memory-efficient) or default store
-	keyStore    *KeyOnlyStore     // non-nil when using memory-efficient mode
+	store       cache.Store   // may be KeyOnlyStore (memory-efficient) or default store
+	keyStore    *KeyOnlyStore // non-nil when using memory-efficient mode
 	emitCh      chan emitMsg
 	doneCh      chan struct{} // signals that controller is closed (for event consumers)
 	closed      atomic.Bool   // guards trySend to prevent sends after close
@@ -182,7 +182,7 @@ func (i *ResourceController) InformWithKeyOnlyStore(onSync SyncCallback) (chan s
 			switch delta.Type {
 			case cache.Added, cache.Replaced, cache.Sync:
 				// Update KeyOnlyStore (only tracks keys)
-				keyStore.Add(u)
+				_ = keyStore.Add(u)
 				// Cache name for sorting
 				i.nameCacheMu.Lock()
 				i.nameCache[key] = u.GetName()
@@ -199,7 +199,7 @@ func (i *ResourceController) InformWithKeyOnlyStore(onSync SyncCallback) (chan s
 				}
 
 			case cache.Updated:
-				keyStore.Update(u)
+				_ = keyStore.Update(u)
 				i.nameCacheMu.Lock()
 				i.nameCache[key] = u.GetName()
 				i.nameCacheMu.Unlock()
@@ -213,7 +213,7 @@ func (i *ResourceController) InformWithKeyOnlyStore(onSync SyncCallback) (chan s
 				}
 
 			case cache.Deleted:
-				keyStore.Delete(u)
+				_ = keyStore.Delete(u)
 				i.nameCacheMu.Lock()
 				delete(i.nameCache, key)
 				i.nameCacheMu.Unlock()

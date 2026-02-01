@@ -332,28 +332,6 @@ func (fs *FieldStore) ReconstructObject(key string) map[string]interface{} {
 	return actual.(map[string]interface{})
 }
 
-// getFieldByPath retrieves a value from a nested map using dot notation.
-// e.g., "metadata.name" retrieves obj["metadata"]["name"]
-func getFieldByPath(obj map[string]interface{}, path string) (interface{}, bool) {
-	parts := strings.Split(path, ".")
-	current := interface{}(obj)
-
-	for _, part := range parts {
-		switch v := current.(type) {
-		case map[string]interface{}:
-			val, ok := v[part]
-			if !ok {
-				return nil, false
-			}
-			current = val
-		default:
-			return nil, false
-		}
-	}
-
-	return current, true
-}
-
 // pathPartsPool reduces allocations for path splitting in setFieldByPath.
 // Each []string slice is reused for parsing dot-separated paths.
 var pathPartsPool = sync.Pool{

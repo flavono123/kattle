@@ -719,10 +719,10 @@ var _ = Describe("isUnderExtractPath", func() {
 
 		It("handles single entry extractSet", func() {
 			singleEntry := map[string]struct{}{"spec.containers": {}}
-			Expect(isUnderExtractPath("spec", singleEntry)).To(BeTrue())           // ancestor
-			Expect(isUnderExtractPath("spec.containers", singleEntry)).To(BeTrue()) // exact
+			Expect(isUnderExtractPath("spec", singleEntry)).To(BeTrue())              // ancestor
+			Expect(isUnderExtractPath("spec.containers", singleEntry)).To(BeTrue())   // exact
 			Expect(isUnderExtractPath("spec.containers.0", singleEntry)).To(BeTrue()) // descendant
-			Expect(isUnderExtractPath("spec.nodeName", singleEntry)).To(BeFalse())  // sibling
+			Expect(isUnderExtractPath("spec.nodeName", singleEntry)).To(BeFalse())    // sibling
 		})
 	})
 })
