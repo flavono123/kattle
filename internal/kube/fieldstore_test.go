@@ -619,3 +619,110 @@ var _ = Describe("FieldStore", func() {
 		})
 	})
 })
+
+var _ = Describe("isUnderExtractPath", func() {
+	var extractSet map[string]struct{}
+
+	BeforeEach(func() {
+		extractSet = map[string]struct{}{
+			"metadata.labels": {},
+			"spec.nodeName":   {},
+			"spec.containers": {},
+			"status.phase":    {},
+		}
+	})
+
+	Context("exact match", func() {
+		It("returns true for path in extractSet", func() {
+			Expect(isUnderExtractPath("metadata.labels", extractSet)).To(BeTrue())
+			Expect(isUnderExtractPath("spec.nodeName", extractSet)).To(BeTrue())
+			Expect(isUnderExtractPath("spec.containers", extractSet)).To(BeTrue())
+			Expect(isUnderExtractPath("status.phase", extractSet)).To(BeTrue())
+		})
+	})
+
+	Context("ancestor path (path is prefix of selected)", func() {
+		It("returns true when path is ancestor of selected field", func() {
+			// "spec" is ancestor of "spec.nodeName" and "spec.containers"
+			Expect(isUnderExtractPath("spec", extractSet)).To(BeTrue())
+			// "metadata" is ancestor of "metadata.labels"
+			Expect(isUnderExtractPath("metadata", extractSet)).To(BeTrue())
+		})
+
+		It("returns true for root-level ancestor", func() {
+			// "status" is ancestor of "status.phase"
+			Expect(isUnderExtractPath("status", extractSet)).To(BeTrue())
+		})
+	})
+
+	Context("descendant path (selected is prefix of path)", func() {
+		It("returns true when path is under selected field", func() {
+			// "metadata.labels.app" is under "metadata.labels"
+			Expect(isUnderExtractPath("metadata.labels.app", extractSet)).To(BeTrue())
+			Expect(isUnderExtractPath("metadata.labels.env", extractSet)).To(BeTrue())
+		})
+
+		It("returns true for array element paths under selected", func() {
+			// "spec.containers.0" is under "spec.containers"
+			Expect(isUnderExtractPath("spec.containers.0", extractSet)).To(BeTrue())
+			Expect(isUnderExtractPath("spec.containers.0.name", extractSet)).To(BeTrue())
+			Expect(isUnderExtractPath("spec.containers.0.image", extractSet)).To(BeTrue())
+		})
+
+		It("returns true for deeply nested paths under selected", func() {
+			// Deep nesting under spec.containers
+			Expect(isUnderExtractPath("spec.containers.0.env.0.valueFrom.secretKeyRef.name", extractSet)).To(BeTrue())
+		})
+	})
+
+	Context("unrelated path", func() {
+		It("returns false for completely unrelated paths", func() {
+			// "spec.volumes" has no relation to extractSet
+			Expect(isUnderExtractPath("spec.volumes", extractSet)).To(BeFalse())
+			Expect(isUnderExtractPath("spec.volumes.0.name", extractSet)).To(BeFalse())
+			// "metadata.annotations" not selected
+			Expect(isUnderExtractPath("metadata.annotations", extractSet)).To(BeFalse())
+			Expect(isUnderExtractPath("metadata.annotations.key", extractSet)).To(BeFalse())
+		})
+
+		It("returns false for partial string matches (not path prefix)", func() {
+			// "spec.node" is NOT ancestor of "spec.nodeName" (no dot boundary)
+			Expect(isUnderExtractPath("spec.node", extractSet)).To(BeFalse())
+			// "metadata.label" is NOT ancestor of "metadata.labels"
+			Expect(isUnderExtractPath("metadata.label", extractSet)).To(BeFalse())
+			// "status.phas" is NOT ancestor of "status.phase"
+			Expect(isUnderExtractPath("status.phas", extractSet)).To(BeFalse())
+		})
+
+		It("returns false for sibling paths", func() {
+			// "spec.serviceAccount" is sibling, not related to selected paths
+			Expect(isUnderExtractPath("spec.serviceAccount", extractSet)).To(BeFalse())
+			// "metadata.name" is sibling of "metadata.labels"
+			Expect(isUnderExtractPath("metadata.name", extractSet)).To(BeFalse())
+		})
+	})
+
+	Context("edge cases", func() {
+		It("handles empty extractSet", func() {
+			emptySet := map[string]struct{}{}
+			Expect(isUnderExtractPath("any.path", emptySet)).To(BeFalse())
+			Expect(isUnderExtractPath("metadata.labels", emptySet)).To(BeFalse())
+		})
+
+		It("handles single-segment paths", func() {
+			singleSet := map[string]struct{}{"metadata": {}}
+			Expect(isUnderExtractPath("metadata", singleSet)).To(BeTrue())
+			Expect(isUnderExtractPath("metadata.name", singleSet)).To(BeTrue())
+			Expect(isUnderExtractPath("metadata.labels.app", singleSet)).To(BeTrue())
+			Expect(isUnderExtractPath("spec", singleSet)).To(BeFalse())
+		})
+
+		It("handles single entry extractSet", func() {
+			singleEntry := map[string]struct{}{"spec.containers": {}}
+			Expect(isUnderExtractPath("spec", singleEntry)).To(BeTrue())           // ancestor
+			Expect(isUnderExtractPath("spec.containers", singleEntry)).To(BeTrue()) // exact
+			Expect(isUnderExtractPath("spec.containers.0", singleEntry)).To(BeTrue()) // descendant
+			Expect(isUnderExtractPath("spec.nodeName", singleEntry)).To(BeFalse())  // sibling
+		})
+	})
+})
