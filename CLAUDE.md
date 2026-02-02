@@ -224,7 +224,7 @@ Manager는 시나리오를 파싱하여:
                  │      │  (Manager)  │
                  │      └──────┬──────┘
                  │             │
-                 │             │ retry < 3?
+                 │             │ retry < 5?
                  │             ├─── YES ──▶ (back to EXECUTE)
                  │             │
                  │             │ NO
@@ -306,7 +306,7 @@ Manager는 시나리오를 파싱하여:
 ### Exit Conditions
 
 - ✅ 모든 subtask 완료 + 검증 통과
-- ⚠️ 재시도 3회 초과 → 사용자 에스컬레이션
+- ⚠️ 재시도 5회 초과 → 사용자 에스컬레이션
 - 🛑 사용자 중단 요청
 
 ---
@@ -397,11 +397,88 @@ Task(subagent_type="kattle:verifier", prompt="Verify subtask 2")
 
 ---
 
+## Worktree Strategy
+
+ASSESS 단계에서 TASK(spec) 단위로 git worktree 분기.
+
+### Worktree 명명 규칙
+
+```
+위치: /Users/hansuk.hong/P/kattle-<suffix>
+브랜치: <type>/<name>-<description>
+
+예시:
+├── kattle/                      # main (오케스트레이터 작업)
+├── kattle-task-a/               # feature/task-a-add-printer-columns
+├── kattle-fix-memory/           # fix/memory-leak-in-watch
+└── kattle-refactor-ui/          # refactor/ui-component-structure
+```
+
+### Worktree 명령
+
+```bash
+# 새 TASK 시작 (또는 /worktree-task 스킬 사용)
+git -C /Users/hansuk.hong/P/kattle worktree add \
+  /Users/hansuk.hong/P/kattle-<task-name> \
+  -b <type>/<task-name>-<description>
+
+# 정리 (원격 삭제된 브랜치)
+/clean_gone
+
+# 현재 worktree 목록 확인
+git -C /Users/hansuk.hong/P/kattle worktree list
+```
+
+### Worktree 라이프사이클 (사용자 검증 포함)
+
+```
+/worktree-task feature task-x description
+        │
+        ▼
+   [개발 작업] ◄──────────────────────┐
+        │                              │
+        ▼                              │
+   /commit-push-pr                     │
+        │                              │
+        ▼                              │
+   [사용자 검증 요청]                   │
+   "PR 검토 후 PASS/FAIL 알려주세요"    │
+        │                              │
+   ┌────┴────┐                         │
+   ▼         ▼                         │
+ PASS      FAIL ──▶ retry < 5? ──YES──┘
+   │                    │
+   │                   NO
+   │                    ▼
+   │                 [ABORT]
+   ▼
+ [PR 머지]
+   │
+   ▼
+ /clean_gone
+   │
+   ▼
+ [COMPLETE]
+```
+
+---
+
 ## Key Files
 
 - `planning/*.spec.md` - 기능 스펙 문서
 - `CODE_QUALITY_GO.md` - Go 코드 품질 가이드라인
 - `cmd/gui/frontend/CODE_QUALITY.md` - React 코드 품질 가이드라인
+
+## Skills
+
+| Skill | 용도 |
+|-------|------|
+| `/worktree-task` | TASK용 worktree 생성 |
+| `/commit` | 변경사항 커밋 |
+| `/commit-push-pr` | 커밋 + 푸시 + PR 생성 |
+| `/clean_gone` | 삭제된 원격 브랜치/worktree 정리 |
+
+---
 
 ## Commands
 

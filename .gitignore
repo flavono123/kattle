@@ -29,3 +29,4 @@ assets/releases/
 *_heap.*
 
 ./claude
+llms.txt
