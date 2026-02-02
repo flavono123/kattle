@@ -34,6 +34,7 @@ import { CellContent } from './CellContent';
 import { DIYTableToolbar, DIYTableToolbarHandle } from './DIYTableToolbar';
 import { useCellHighlight } from '../hooks/useCellHighlight';
 import { useResourceData } from '../hooks/useResourceData';
+import { useWindowedData, type SortConfig } from '../hooks/useWindowedData';
 import { useFlashingCells } from '../hooks/useFlashingCells';
 import type { main } from '../../wailsjs/go/models';
 
@@ -52,6 +53,8 @@ interface DIYTableProps {
   previewField?: string[];  // Unchecked field to preview as muted column at the end
   onPreviewClear?: () => void;  // Callback to clear preview before export
   expandButton?: React.ReactNode;  // Sidebar expand button (shown when collapsed)
+  /** Enable windowed mode for large datasets (>1000 rows). Uses server-side sorting and lazy loading. */
+  useWindowedMode?: boolean;
 }
 
 export interface DIYTableHandle {
@@ -263,25 +266,84 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
   previewField,
   onPreviewClear,
   expandButton,
+  useWindowedMode = false,
 }, ref) => {
   // Convert selectedFields from string[][] to string[] (dot notation) for the hook
   const selectedFieldPaths = useMemo(() => {
     return selectedFields.map(field => field.join('.'));
   }, [selectedFields]);
 
-  // Use extracted hook for data fetching (watch enabled for real-time updates)
-  // Pass selectedFields so the backend extracts the correct field values
-  const { data, loading, getRowId, changedCells } = useResourceData(
-    selectedGVK,
-    connectedContexts,
+  const [globalFilter, setGlobalFilter] = useState('');
+  const [sorting, setSorting] = useState<SortingState>([]);
+
+  // Convert TanStack sorting state to server-side sort config
+  const serverSort: SortConfig | undefined = useMemo(() => {
+    if (sorting.length === 0) return undefined;
+    const sort = sorting[0];
+    if (!sort) return undefined;
+    return {
+      field: sort.id,
+      descending: sort.desc,
+    };
+  }, [sorting]);
+
+  // Use windowed data for large datasets (lazy loading)
+  const windowedResult = useWindowedData(
+    useWindowedMode ? selectedGVK : null,
+    useWindowedMode ? connectedContexts : [],
+    {
+      selectedFields: selectedFieldPaths,
+      sort: serverSort,
+      overscan: 30,
+    }
+  );
+
+  // Use standard data fetching for small datasets
+  const standardResult = useResourceData(
+    !useWindowedMode ? selectedGVK : null,
+    !useWindowedMode ? connectedContexts : [],
     { watch: true, selectedFields: selectedFieldPaths }
   );
 
+  // Unified interface
+  const loading = useWindowedMode ? windowedResult.loading : standardResult.loading;
+  const totalCount = useWindowedMode ? windowedResult.totalCount : standardResult.data.length;
+  const changedCells = useWindowedMode ? [] : standardResult.changedCells;  // No cell flashing in windowed mode
+
+  // For windowed mode, create virtual data array with actual data where loaded
+  // TanStack Table needs this for row model creation
+  const data = useMemo(() => {
+    if (!useWindowedMode) {
+      return standardResult.data;
+    }
+    // Create array of size totalCount with loaded data inserted at correct indices
+    // This is more memory efficient than creating placeholder objects for all rows
+    const result: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < totalCount; i++) {
+      const rowData = windowedResult.getRowData(i);
+      if (rowData) {
+        result[i] = rowData;
+      } else {
+        // Placeholder for unloaded rows - minimal object with index
+        result[i] = { _placeholder: true, _index: i };
+      }
+    }
+    return result;
+  }, [useWindowedMode, totalCount, standardResult.data, windowedResult.visibleRows]);
+
+  // Row ID function
+  const getRowId = useCallback((row: Record<string, unknown>, index: number) => {
+    if (useWindowedMode) {
+      // For windowed mode, use _key if available, otherwise use index
+      const key = row._key as string | undefined;
+      if (key) return key;
+      return `_placeholder_${index}`;
+    }
+    return standardResult.getRowId(row);
+  }, [useWindowedMode, standardResult.getRowId]);
+
   // Track flashing cells for real-time update visualization
   const { isFlashing } = useFlashingCells(changedCells);
-
-  const [globalFilter, setGlobalFilter] = useState('');
-  const [sorting, setSorting] = useState<SortingState>([]);
   const tableContainerRef = useRef<HTMLDivElement>(null);
   const toolbarRef = useRef<DIYTableToolbarHandle>(null);
 
@@ -428,7 +490,7 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
 
   // Create dynamic columns from selectedFields with default columns prepended
   // Also includes preview column at the end if previewField is set
-  const columns = useMemo<ColumnDef<any>[]>(() => {
+  const columns = useMemo<ColumnDef<Record<string, unknown>>[]>(() => {
     // Always add default columns at the beginning
     let fieldsToUse: string[][];
 
@@ -440,7 +502,7 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
       fieldsToUse = [['_context'], ['metadata', 'name'], ...selectedFields];
     }
 
-    const cols: ColumnDef<any>[] = fieldsToUse.map((fieldPath) => {
+    const cols: ColumnDef<Record<string, unknown>>[] = fieldsToUse.map((fieldPath) => {
       const fieldName = fieldPath[fieldPath.length - 1];
       const columnId = fieldPath.join('.');
       const widths = columnWidths[columnId] || { size: 100, maxSize: 300 };
@@ -509,22 +571,25 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
   }, [selectedFields, connectedContexts, columnWidths, getHighlightIndices, previewField]);
 
   // Create table instance
+  // In windowed mode: disable client-side sorting/filtering (handled by server)
   const table = useReactTable({
     data,
     columns,
     getRowId,  // Stable row identity for real-time updates
     columnResizeMode: 'onChange',  // Enable column resizing
-    globalFilterFn: fuzzyFilter,
+    globalFilterFn: useWindowedMode ? undefined : fuzzyFilter,
     enableSortingRemoval: false,  // Toggle between asc/desc only (no "none" state)
+    manualSorting: useWindowedMode,  // Server-side sorting in windowed mode
+    manualFiltering: useWindowedMode,  // Server-side filtering in windowed mode
     state: {
-      globalFilter,
+      globalFilter: useWindowedMode ? '' : globalFilter,  // Disable filter in windowed mode
       sorting,
     },
-    onGlobalFilterChange: setGlobalFilter,
+    onGlobalFilterChange: useWindowedMode ? undefined : setGlobalFilter,
     onSortingChange: setSorting,
     getCoreRowModel: getCoreRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-    getSortedRowModel: getSortedRowModel(),
+    getFilteredRowModel: useWindowedMode ? undefined : getFilteredRowModel(),
+    getSortedRowModel: useWindowedMode ? undefined : getSortedRowModel(),
   });
 
   // Get filtered rows for virtualization
@@ -616,12 +681,28 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
   // Get total width from table state (updates on resize)
   const totalColumnsWidth = table.getTotalSize();
 
+  // Track previous visible range to prevent infinite loops
+  const prevVisibleRangeRef = useRef({ start: -1, end: -1 });
+
   // Setup row virtualizer
+  // In windowed mode, use totalCount for proper scrollbar sizing
+  // and notify about visible range changes for lazy loading
   const rowVirtualizer = useVirtualizer({
-    count: rows.length,
+    count: useWindowedMode ? totalCount : rows.length,
     getScrollElement: () => tableContainerRef.current,
     estimateSize: () => 28,  // Estimated row height in pixels (reduced from 35)
-    overscan: 10,  // Render 10 extra rows above/below viewport
+    overscan: useWindowedMode ? 30 : 10,  // More overscan in windowed mode for smoother scrolling
+    onChange: useWindowedMode ? (instance) => {
+      const range = instance.range;
+      if (range) {
+        // Only notify if range actually changed (prevents infinite loops)
+        const prev = prevVisibleRangeRef.current;
+        if (prev.start !== range.startIndex || prev.end !== range.endIndex) {
+          prevVisibleRangeRef.current = { start: range.startIndex, end: range.endIndex };
+          windowedResult.onVisibleRangeChange(range.startIndex, range.endIndex);
+        }
+      }
+    } : undefined,
   });
 
   // Auto-scroll to keep focused row visible
@@ -795,6 +876,38 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
               {rowVirtualizer.getVirtualItems().map((virtualRow) => {
                 const row = rows[virtualRow.index];
                 const isRowFocused = focusedRowIndex === virtualRow.index;
+
+                // In windowed mode, check if this row is a placeholder (not yet loaded)
+                const isPlaceholder = useWindowedMode && (!row || row.original?._placeholder);
+
+                // Render placeholder skeleton for unloaded rows
+                if (isPlaceholder) {
+                  return (
+                    <div
+                      key={`placeholder-${virtualRow.index}`}
+                      className="flex border-b border-border absolute top-0 left-0"
+                      style={{
+                        height: `${virtualRow.size}px`,
+                        transform: `translateY(${virtualRow.start}px)`,
+                        width: `max(${totalColumnsWidth}px, 100%)`,
+                      }}
+                    >
+                      {columns.map((col, colIndex) => (
+                        <div
+                          key={`skeleton-${virtualRow.index}-${colIndex}`}
+                          className="px-1 py-1 flex-shrink-0 flex items-center"
+                          style={{
+                            width: `${col.size || 100}px`,
+                            minWidth: `${col.minSize || 80}px`,
+                          }}
+                        >
+                          <div className="h-4 bg-muted/50 rounded animate-pulse w-3/4" />
+                        </div>
+                      ))}
+                    </div>
+                  );
+                }
+
                 return (
                   <div
                     key={row.id}

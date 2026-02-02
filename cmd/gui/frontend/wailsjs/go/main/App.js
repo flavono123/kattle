@@ -34,12 +34,20 @@ export function GetNodeTree(arg1, arg2) {
   return window['go']['main']['App']['GetNodeTree'](arg1, arg2);
 }
 
+export function GetResourceCount() {
+  return window['go']['main']['App']['GetResourceCount']();
+}
+
 export function GetResources(arg1, arg2) {
   return window['go']['main']['App']['GetResources'](arg1, arg2);
 }
 
 export function GetResourcesByKeys(arg1) {
   return window['go']['main']['App']['GetResourcesByKeys'](arg1);
+}
+
+export function GetResourcesRange(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['GetResourcesRange'](arg1, arg2, arg3, arg4);
 }
 
 export function Greet(arg1) {

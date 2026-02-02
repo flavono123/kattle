@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -22,6 +23,10 @@ import (
 	"github.com/flavono123/kattle/internal/store"
 )
 
+// useSQLStore determines whether to use SQLStore instead of FieldStore.
+// Set KATTLE_USE_SQLSTORE=1 environment variable to enable.
+var useSQLStore = os.Getenv("KATTLE_USE_SQLSTORE") == "1"
+
 // logMemoryStats logs current goroutine count and event metrics for debugging
 func logMemoryStats(label string) {
 	emitted, dropped, synced, trySent := kube.GetEventMetrics()
@@ -40,6 +45,7 @@ type App struct {
 	stopChs     []chan struct{}
 	watchDone   chan struct{}
 	fieldStore  *kube.FieldStore // key: "context/namespace/name" → value: extracted fields
+	sqlStore    *kube.SQLStore   // SQLite-based store (enabled via KATTLE_USE_SQLSTORE=1)
 }
 
 // watchController wraps a ResourceController with context info
@@ -72,6 +78,22 @@ func (a *App) startup(ctx context.Context) {
 		}
 		log.Printf("favorite store initialized (dev=%v)", devMode)
 	}
+
+	// Initialize SQLStore if feature flag is enabled
+	// Uses file-based SQLite to move data OFF the Go heap
+	if useSQLStore {
+		// Create temp file for SQLite database
+		tmpDir := os.TempDir()
+		dbPath := filepath.Join(tmpDir, fmt.Sprintf("kattle-%d.db", os.Getpid()))
+
+		sqlStore, err := kube.NewSQLStore(dbPath)
+		if err != nil {
+			log.Printf("failed to create SQLStore: %v", err)
+		} else {
+			a.sqlStore = sqlStore
+			log.Printf("SQLStore initialized (file: %s)", dbPath)
+		}
+	}
 }
 
 // shutdown is called when the app is closing.
@@ -79,6 +101,15 @@ func (a *App) startup(ctx context.Context) {
 func (a *App) shutdown(ctx context.Context) {
 	log.Printf("App shutting down, cleaning up resources...")
 	a.StopWatch()
+
+	// Close SQLStore
+	if a.sqlStore != nil {
+		if err := a.sqlStore.Close(); err != nil {
+			log.Printf("Warning: failed to close SQLStore: %v", err)
+		}
+		a.sqlStore = nil
+	}
+
 	log.Printf("App shutdown complete")
 }
 
@@ -366,18 +397,82 @@ func (a *App) GetResources(gvk MultiClusterGVK, contexts []string) ([]map[string
 }
 
 // ResourceEventMeta represents a watch event with optional delta data.
-// For ADDED/MODIFIED: includes Fields (reconstructed object) for direct frontend update.
-// For DELETED: Fields is omitted.
-// This eliminates the need for frontend to call GetResourcesByKeys for real-time updates.
+// - When KATTLE_USE_SQLSTORE=0 (default): includes Fields for direct frontend update (delta model)
+// - When KATTLE_USE_SQLSTORE=1: Fields is omitted, frontend uses Pull Model via GetResourcesByKeys
+// For DELETED events: Fields is always omitted.
 type ResourceEventMeta struct {
 	Type   string                 `json:"type"`             // "ADDED", "MODIFIED", "DELETED"
 	Key    string                 `json:"key"`              // "context/namespace/name" unique identifier
-	Fields map[string]interface{} `json:"fields,omitempty"` // Reconstructed object (only for ADDED/MODIFIED)
+	Fields map[string]interface{} `json:"fields,omitempty"` // Reconstructed object (only when !useSQLStore and not DELETED)
 }
 
 // makeResourceKey creates a unique cache key for a resource
 func makeResourceKey(context, namespace, name string) string {
 	return fmt.Sprintf("%s/%s/%s", context, namespace, name)
+}
+
+// Essential metadata fields to always extract for SQLStore
+var essentialFieldPaths = []string{
+	"metadata.name",
+	"metadata.namespace",
+	"metadata.uid",
+	"metadata.resourceVersion",
+	"metadata.creationTimestamp",
+	"metadata.labels",
+	"metadata.ownerReferences",
+	"metadata.deletionTimestamp",
+	"metadata.finalizers",
+}
+
+// extractFieldsForSQL extracts essential + selected fields from an unstructured object
+// for storage in SQLStore. This avoids FieldStore overhead while maintaining
+// the same field extraction logic.
+func extractFieldsForSQL(obj *unstructured.Unstructured, selectedFields []string) map[string]any {
+	result := make(map[string]any)
+
+	// Build extraction set
+	extractPaths := make(map[string]struct{})
+	for _, p := range essentialFieldPaths {
+		extractPaths[p] = struct{}{}
+	}
+	for _, p := range selectedFields {
+		extractPaths[p] = struct{}{}
+	}
+
+	// Extract each field path
+	for path := range extractPaths {
+		if val, found, err := unstructured.NestedFieldCopy(obj.Object, splitPath(path)...); err == nil && found {
+			setNestedField(result, path, val)
+		}
+	}
+
+	return result
+}
+
+// splitPath splits a dot-separated path into parts
+func splitPath(path string) []string {
+	return strings.Split(path, ".")
+}
+
+// setNestedField sets a value at a nested path in a map
+func setNestedField(obj map[string]any, path string, value any) {
+	parts := splitPath(path)
+	current := obj
+
+	for i := 0; i < len(parts)-1; i++ {
+		part := parts[i]
+		if _, ok := current[part]; !ok {
+			current[part] = make(map[string]any)
+		}
+		if next, ok := current[part].(map[string]any); ok {
+			current = next
+		} else {
+			// Can't traverse further, skip
+			return
+		}
+	}
+
+	current[parts[len(parts)-1]] = value
 }
 
 // StartWatch starts watching resources for the given GVK across specified contexts
@@ -416,8 +511,16 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 		a.fieldStore.SetSelectedFields(selectedFields)
 	}
 
-	// Capture fieldStore reference for goroutines
+	// Clear SQLStore if it exists (parallel operation mode)
+	if a.sqlStore != nil {
+		if err := a.sqlStore.Clear(); err != nil {
+			log.Printf("Warning: failed to clear SQLStore: %v", err)
+		}
+	}
+
+	// Capture store references for goroutines
 	fs := a.fieldStore
+	ss := a.sqlStore // may be nil if feature flag is disabled
 	watchDone := a.watchDone
 
 	a.watchMu.Unlock()
@@ -464,14 +567,35 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 			controller := kube.NewResourceControllerForContext(ctx, gvr)
 
 			// Synchronous callback for initial sync - called in informer's goroutine.
-			// This populates FieldStore AND emits batch progress events for progressive loading.
-			// Instead of 6000+ individual events (overwhelms JS), emit ~60 progress events.
+			// This populates store (SQLStore OR FieldStore) and emits batch progress events.
+			// When useSQLStore=true, FieldStore is SKIPPED to reduce Go heap memory.
 			onSync := func(eventType kube.EventType, obj *unstructured.Unstructured) {
 				key := makeResourceKey(ctx, obj.GetNamespace(), obj.GetName())
 				if eventType == kube.EventDeleted {
-					fs.Delete(key)
+					if useSQLStore && ss != nil {
+						if err := ss.Delete(key); err != nil {
+							log.Printf("Warning: SQLStore delete failed for %s: %v", key, err)
+						}
+					} else {
+						fs.Delete(key)
+					}
 				} else {
-					fs.Update(key, obj)
+					if useSQLStore && ss != nil {
+						// Store directly in SQLStore, skip FieldStore entirely
+						// Extract essential fields inline to avoid FieldStore overhead
+						fields := extractFieldsForSQL(obj, selectedFields)
+						data, err := json.Marshal(fields)
+						if err != nil {
+							log.Printf("Warning: failed to marshal fields for %s: %v", key, err)
+						} else {
+							if err := ss.Upsert(key, ctx, obj.GetNamespace(), obj.GetName(), data); err != nil {
+								log.Printf("Warning: SQLStore upsert failed for %s: %v", key, err)
+							}
+						}
+					} else {
+						// Legacy: use FieldStore
+						fs.Update(key, obj)
+					}
 				}
 
 				// Send progress update to dedicated emitter goroutine (non-blocking)
@@ -517,12 +641,21 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 
 						key := makeResourceKey(ctxName, event.Obj.GetNamespace(), event.Obj.GetName())
 
-						// Get fieldStore reference under lock to avoid race with StopWatch
+						// Get store references under lock to avoid race with StopWatch
 						a.watchMu.RLock()
 						currentFs := a.fieldStore
+						currentSs := a.sqlStore
+						currentSelectedFields := []string{}
+						if currentFs != nil {
+							currentSelectedFields = currentFs.GetSelectedFields()
+						}
 						a.watchMu.RUnlock()
 
-						if currentFs == nil {
+						// Skip if no store available
+						if useSQLStore && currentSs == nil {
+							continue
+						}
+						if !useSQLStore && currentFs == nil {
 							continue
 						}
 
@@ -532,27 +665,42 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 						}
 
 						if string(event.Type) == "DELETED" {
-							currentFs.Delete(key)
+							if useSQLStore && currentSs != nil {
+								if err := currentSs.Delete(key); err != nil {
+									log.Printf("Warning: SQLStore delete failed for %s: %v", key, err)
+								}
+							} else if currentFs != nil {
+								currentFs.Delete(key)
+							}
 							// No fields for DELETED events
 						} else {
-							// Update FieldStore first
-							currentFs.Update(key, event.Obj)
+							if useSQLStore && currentSs != nil {
+								// Store directly in SQLStore, skip FieldStore
+								fields := extractFieldsForSQL(event.Obj, currentSelectedFields)
+								data, err := json.Marshal(fields)
+								if err != nil {
+									log.Printf("Warning: failed to marshal fields for %s: %v", key, err)
+								} else {
+									if err := currentSs.Upsert(key, ctxName, event.Obj.GetNamespace(), event.Obj.GetName(), data); err != nil {
+										log.Printf("Warning: SQLStore upsert failed for %s: %v", key, err)
+									}
+								}
+							} else if currentFs != nil {
+								// Legacy: use FieldStore
+								currentFs.Update(key, event.Obj)
 
-							// Include reconstructed object in event (delta update)
-							// This eliminates the need for frontend to call GetResourcesByKeys
-							if cachedFields := currentFs.ReconstructObject(key); cachedFields != nil {
-								// Make a shallow copy since ReconstructObject returns cached object
-								// that should not be modified
-								fields := make(map[string]interface{}, len(cachedFields)+1)
-								for k, v := range cachedFields {
-									fields[k] = v
+								// Include reconstructed object in event (delta update)
+								if cachedFields := currentFs.ReconstructObject(key); cachedFields != nil {
+									fields := make(map[string]interface{}, len(cachedFields)+1)
+									for k, v := range cachedFields {
+										fields[k] = v
+									}
+									parts := strings.SplitN(key, "/", 2)
+									if len(parts) > 0 {
+										fields["_context"] = parts[0]
+									}
+									eventMeta.Fields = fields
 								}
-								// Extract context from key (format: "context/namespace/name")
-								parts := strings.SplitN(key, "/", 2)
-								if len(parts) > 0 {
-									fields["_context"] = parts[0]
-								}
-								eventMeta.Fields = fields
 							}
 						}
 
@@ -573,8 +721,19 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 		close(progressCh)
 		<-progressDone
 
-		count := fs.Count()
-		log.Printf("All initial syncs complete, total FieldStore count: %d", count)
+		// Get count from the active store
+		var count int
+		if useSQLStore && ss != nil {
+			var err error
+			count, err = ss.Count()
+			if err != nil {
+				log.Printf("Warning: failed to get SQLStore count: %v", err)
+			}
+			log.Printf("All initial syncs complete, total SQLStore count: %d", count)
+		} else {
+			count = fs.Count()
+			log.Printf("All initial syncs complete, total FieldStore count: %d", count)
+		}
 		logMemoryStats("StartWatch-SyncComplete")
 
 		// Emit sync:complete event so frontend knows data is ready
@@ -634,6 +793,13 @@ func (a *App) StopWatch() {
 	}
 	a.fieldStore = nil
 
+	// Clear SQLStore (but keep it open for next watch)
+	if a.sqlStore != nil {
+		if err := a.sqlStore.Clear(); err != nil {
+			log.Printf("Warning: failed to clear SQLStore: %v", err)
+		}
+	}
+
 	log.Printf("Stopped all resource watches")
 	logMemoryStats("StopWatch")
 
@@ -655,16 +821,30 @@ func (a *App) SetSelectedFields(fields []string) {
 	}
 }
 
-// GetResourcesByKeys fetches resources from FieldStore by keys (Pull Model)
+// GetResourcesByKeys fetches resources by keys (Pull Model)
+// - When KATTLE_USE_SQLSTORE=1: queries SQLStore (disk-based)
+// - When KATTLE_USE_SQLSTORE=0: queries FieldStore (memory-based, legacy)
 // Called by frontend after receiving resource:update events
 func (a *App) GetResourcesByKeys(keys []string) []map[string]any {
-	log.Printf("[DEBUG] GetResourcesByKeys: called with %d keys", len(keys))
+	log.Printf("[DEBUG] GetResourcesByKeys: called with %d keys, useSQLStore=%v", len(keys), useSQLStore)
 
-	// Get fieldStore reference under lock to avoid race with StopWatch
+	// Get store references under lock to avoid race with StopWatch
 	a.watchMu.RLock()
 	fs := a.fieldStore
+	ss := a.sqlStore
 	a.watchMu.RUnlock()
 
+	// Use SQLStore if feature flag is enabled
+	if useSQLStore && ss != nil {
+		result, err := ss.GetByKeys(keys)
+		if err != nil {
+			log.Printf("Warning: SQLStore GetByKeys failed: %v", err)
+			return make([]map[string]any, 0)
+		}
+		return result
+	}
+
+	// Fallback to FieldStore (legacy behavior)
 	result := make([]map[string]any, 0, len(keys))
 	if fs == nil {
 		log.Printf("[DEBUG] GetResourcesByKeys: fieldStore is nil, returning empty")
@@ -684,21 +864,104 @@ func (a *App) GetResourcesByKeys(keys []string) []map[string]any {
 	return result
 }
 
-// GetAllResourceKeys returns all resource keys currently in the FieldStore.
+// GetAllResourceKeys returns all resource keys currently stored.
+// - When KATTLE_USE_SQLSTORE=1: queries SQLStore
+// - When KATTLE_USE_SQLSTORE=0: queries FieldStore
 // Called by frontend after StartWatch to get initial batch of keys.
 // This is needed because trySend drops events when buffer is full during initial sync.
 func (a *App) GetAllResourceKeys() []string {
 	a.watchMu.RLock()
 	defer a.watchMu.RUnlock()
 
+	// Use SQLStore if feature flag is enabled
+	if useSQLStore && a.sqlStore != nil {
+		keys, err := a.sqlStore.List()
+		if err != nil {
+			log.Printf("Warning: SQLStore List failed: %v", err)
+			return []string{}
+		}
+		log.Printf("[DEBUG] GetAllResourceKeys (SQLStore): returning %d keys", len(keys))
+		return keys
+	}
+
+	// Fallback to FieldStore (legacy behavior)
 	if a.fieldStore == nil {
 		log.Printf("[DEBUG] GetAllResourceKeys: fieldStore is nil, returning empty")
 		return []string{}
 	}
 
 	keys := a.fieldStore.List()
-	log.Printf("[DEBUG] GetAllResourceKeys: returning %d keys", len(keys))
+	log.Printf("[DEBUG] GetAllResourceKeys (FieldStore): returning %d keys", len(keys))
 	return keys
+}
+
+// GetResourceCount returns the total count of resources.
+// Used by frontend for virtualization (to know total scroll height).
+func (a *App) GetResourceCount() int {
+	a.watchMu.RLock()
+	defer a.watchMu.RUnlock()
+
+	if useSQLStore && a.sqlStore != nil {
+		count, err := a.sqlStore.Count()
+		if err != nil {
+			log.Printf("Warning: SQLStore Count failed: %v", err)
+			return 0
+		}
+		return count
+	}
+
+	if a.fieldStore != nil {
+		return a.fieldStore.Count()
+	}
+	return 0
+}
+
+// GetResourcesRange returns resources for the given range (0-indexed) with sorting.
+// This is the key API for virtualized table - only fetches visible rows.
+// sortField: field path to sort by (e.g., "metadata.creationTimestamp")
+// sortDesc: true for descending order
+func (a *App) GetResourcesRange(start, end int, sortField string, sortDesc bool) []map[string]any {
+	a.watchMu.RLock()
+	defer a.watchMu.RUnlock()
+
+	if useSQLStore && a.sqlStore != nil {
+		result, err := a.sqlStore.GetRange(start, end, sortField, sortDesc)
+		if err != nil {
+			log.Printf("Warning: SQLStore GetRange failed: %v", err)
+			return make([]map[string]any, 0)
+		}
+		log.Printf("[DEBUG] GetResourcesRange: returning %d rows (start=%d, end=%d, sort=%s, desc=%v)",
+			len(result), start, end, sortField, sortDesc)
+		return result
+	}
+
+	// Fallback for FieldStore - not efficient but works
+	// FieldStore doesn't support range queries, so we load all and slice
+	log.Printf("Warning: GetResourcesRange called without SQLStore - falling back to full load")
+	if a.fieldStore == nil {
+		return make([]map[string]any, 0)
+	}
+
+	keys := a.fieldStore.List()
+	if start >= len(keys) {
+		return make([]map[string]any, 0)
+	}
+	if end > len(keys) {
+		end = len(keys)
+	}
+
+	result := make([]map[string]any, 0, end-start)
+	for _, key := range keys[start:end] {
+		if obj := a.fieldStore.ReconstructObject(key); obj != nil {
+			parts := strings.SplitN(key, "/", 2)
+			if len(parts) > 0 {
+				obj["_context"] = parts[0]
+			}
+			obj["_key"] = key
+			result = append(result, obj)
+		}
+	}
+	return result
 }
 
 // convertNodeTree converts kube.Node map to frontend TreeNode array

@@ -37,6 +37,22 @@ vi.mock('../hooks/useFlashingCells', () => ({
   })),
 }));
 
+// Mock useWindowedData hook (not used when useWindowedMode=false, but needs to be mocked)
+vi.mock('../hooks/useWindowedData', () => ({
+  useWindowedData: vi.fn(() => ({
+    totalCount: 0,
+    visibleRows: new Map(),
+    loading: false,
+    error: null,
+    watchStatus: 'disconnected',
+    getRowData: () => undefined,
+    getRowId: () => '',
+    onVisibleRangeChange: vi.fn(),
+    fetchRange: { start: 0, end: 0 },
+    refresh: vi.fn(),
+  })),
+}));
+
 // Mock useVirtualizer to render all rows (bypass virtualization in tests)
 vi.mock('@tanstack/react-virtual', () => ({
   useVirtualizer: vi.fn(({ count }) => ({

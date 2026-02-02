@@ -92,10 +92,11 @@ export function useResourceData(
   // Watch subscription
   useEffect(() => {
     if (!watch || !gvk || contexts.length === 0) {
-      setData([]);
-      setLoading(false);
-      setError(null);
-      setWatchStatus('disconnected');
+      // Only update state if needed to avoid infinite loops
+      setData(prev => prev.length === 0 ? prev : []);
+      setLoading(prev => prev === false ? prev : false);
+      setError(prev => prev === null ? prev : null);
+      setWatchStatus(prev => prev === 'disconnected' ? prev : 'disconnected');
       prevGvkRef.current = null;
       prevContextsKeyRef.current = '';
       return;
