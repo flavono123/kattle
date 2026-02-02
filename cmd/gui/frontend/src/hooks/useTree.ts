@@ -886,6 +886,7 @@ export function useTree({
     if (prevFlatNodesMapRef.current === flatNodesMap) {
       return;
     }
+    const prevSize = prevFlatNodesMapRef.current?.size ?? 0;
     prevFlatNodesMapRef.current = flatNodesMap;
 
     // Use refs to get current values without triggering on their changes
@@ -894,6 +895,13 @@ export function useTree({
 
     if (flatNodesMap.size === 0) return;
     if (currentSelectedPaths.size === 0 && currentExpandedPaths.size === 0) return;
+
+    // Skip cleanup if tree appears to be rebuilding (significantly smaller than before)
+    // This prevents losing selections during watch restart when tree is temporarily incomplete
+    if (prevSize > 0 && flatNodesMap.size < prevSize * 0.5) {
+      console.log(`useTree: skipping stale path cleanup (tree rebuilding: ${flatNodesMap.size} < ${prevSize})`);
+      return;
+    }
 
     const stalePaths: string[] = [];
 

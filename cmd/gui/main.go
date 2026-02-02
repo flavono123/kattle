@@ -45,7 +45,7 @@ func DumpMemory(label string) string {
 
 	dumpSeq++
 	timestamp := time.Now().Format("20060102-150405")
-	filename := filepath.Join(dumpDir, fmt.Sprintf("heap_%s_%s_%03d.pb.gz", label, timestamp, dumpSeq))
+	filename := filepath.Join(dumpDir, fmt.Sprintf("heap_%s_%03d_%s.pb.gz", timestamp, dumpSeq, label))
 
 	f, err := os.Create(filename)
 	if err != nil {

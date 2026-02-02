@@ -9,11 +9,15 @@
 // Types for resource events
 export type ResourceEventType = 'ADDED' | 'MODIFIED' | 'DELETED';
 
-// Pull Model: lightweight event with only type and key (no full object)
+// Delta update model: event includes optional fields for direct application.
+// For ADDED/MODIFIED: fields contains the reconstructed object.
+// For DELETED: fields is undefined.
 export interface ResourceEventMeta {
   type: ResourceEventType;
   /** Unique key: "context/namespace/name" */
   key: string;
+  /** Reconstructed object for ADDED/MODIFIED events (delta update) */
+  fields?: Record<string, unknown>;
 }
 
 /**

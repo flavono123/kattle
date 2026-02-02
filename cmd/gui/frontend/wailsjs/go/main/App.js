@@ -10,6 +10,10 @@ export function DeleteFavoriteView(arg1) {
   return window['go']['main']['App']['DeleteFavoriteView'](arg1);
 }
 
+export function GetAllResourceKeys() {
+  return window['go']['main']['App']['GetAllResourceKeys']();
+}
+
 export function GetCurrentContext() {
   return window['go']['main']['App']['GetCurrentContext']();
 }
@@ -66,8 +70,12 @@ export function SaveFile(arg1, arg2) {
   return window['go']['main']['App']['SaveFile'](arg1, arg2);
 }
 
-export function StartWatch(arg1, arg2) {
-  return window['go']['main']['App']['StartWatch'](arg1, arg2);
+export function SetSelectedFields(arg1) {
+  return window['go']['main']['App']['SetSelectedFields'](arg1);
+}
+
+export function StartWatch(arg1, arg2, arg3) {
+  return window['go']['main']['App']['StartWatch'](arg1, arg2, arg3);
 }
 
 export function StopWatch() {
