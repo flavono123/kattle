@@ -54,6 +54,40 @@ type watchController struct {
 	controller  *kube.ResourceController
 }
 
+// cleanupOldDBFiles removes stale kattle database files from previous runs/crashes
+func cleanupOldDBFiles(tmpDir string) {
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		return
+	}
+
+	currentPid := os.Getpid()
+	for _, entry := range entries {
+		name := entry.Name()
+		// Match pattern: kattle-<pid>.db or kattle-<pid>.db-*
+		if !strings.HasPrefix(name, "kattle-") {
+			continue
+		}
+
+		// Extract PID from filename
+		var pid int
+		if _, err := fmt.Sscanf(name, "kattle-%d.db", &pid); err != nil {
+			continue
+		}
+
+		// Skip current process's db file
+		if pid == currentPid {
+			continue
+		}
+
+		// Remove old db file and its WAL/SHM files
+		filePath := filepath.Join(tmpDir, name)
+		if err := os.Remove(filePath); err == nil {
+			log.Printf("Cleaned up old db file: %s", name)
+		}
+	}
+}
+
 // NewApp creates a new App application struct
 func NewApp() *App {
 	return &App{}
@@ -82,8 +116,12 @@ func (a *App) startup(ctx context.Context) {
 	// Initialize SQLStore if feature flag is enabled
 	// Uses file-based SQLite to move data OFF the Go heap
 	if useSQLStore {
-		// Create temp file for SQLite database
 		tmpDir := os.TempDir()
+
+		// Cleanup old kattle db files from previous crashes
+		cleanupOldDBFiles(tmpDir)
+
+		// Create temp file for SQLite database
 		dbPath := filepath.Join(tmpDir, fmt.Sprintf("kattle-%d.db", os.Getpid()))
 
 		sqlStore, err := kube.NewSQLStore(dbPath)

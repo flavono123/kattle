@@ -270,6 +270,21 @@ func (s *SQLStore) Clear() error {
 	return nil
 }
 
+// isValidSortField validates that the sort field only contains safe characters
+// to prevent SQL injection. Allows alphanumeric, dots, underscores, and hyphens.
+func isValidSortField(field string) bool {
+	if field == "" {
+		return true
+	}
+	for _, r := range field {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 // GetRange returns rows for the given range (0-indexed) with optional sorting.
 // sortField: JSON field path to sort by (e.g., "metadata.name", "metadata.creationTimestamp")
 // sortDesc: true for descending order
@@ -286,7 +301,7 @@ func (s *SQLStore) GetRange(start, end int, sortField string, sortDesc bool) ([]
 	// Build ORDER BY clause
 	// For JSON fields, we use json_extract
 	orderBy := "name ASC" // default sort
-	if sortField != "" {
+	if sortField != "" && isValidSortField(sortField) {
 		// Convert dot notation to SQLite json_extract path
 		// e.g., "metadata.creationTimestamp" -> json_extract(data, '$.metadata.creationTimestamp')
 		jsonPath := "$." + sortField

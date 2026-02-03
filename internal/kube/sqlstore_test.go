@@ -219,7 +219,7 @@ func TestSQLStore_List(t *testing.T) {
 
 	// Insert resources
 	for i := 0; i < 3; i++ {
-		key := "ctx/ns/pod" + string(rune('a'+i))
+		key := fmt.Sprintf("ctx/ns/pod%d", i)
 		data := map[string]any{"index": i}
 		jsonData, _ := json.Marshal(data)
 		err = store.Upsert(key, "ctx", "ns", "pod", jsonData)
@@ -242,7 +242,7 @@ func TestSQLStore_Count(t *testing.T) {
 
 	// Insert resources
 	for i := 0; i < 5; i++ {
-		key := "ctx/ns/pod" + string(rune('a'+i))
+		key := fmt.Sprintf("ctx/ns/pod%d", i)
 		data := map[string]any{"index": i}
 		jsonData, _ := json.Marshal(data)
 		err = store.Upsert(key, "ctx", "ns", "pod", jsonData)
@@ -261,7 +261,7 @@ func TestSQLStore_Clear(t *testing.T) {
 
 	// Insert resources
 	for i := 0; i < 3; i++ {
-		key := "ctx/ns/pod" + string(rune('a'+i))
+		key := fmt.Sprintf("ctx/ns/pod%d", i)
 		data := map[string]any{"index": i}
 		jsonData, _ := json.Marshal(data)
 		err = store.Upsert(key, "ctx", "ns", "pod", jsonData)
