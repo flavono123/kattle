@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -45,6 +46,12 @@ func NewSQLStore(dbPath string) (*SQLStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to ping SQLite database: %w", err)
 	}
+
+	// Set connection pool limits to prevent excessive connections
+	// SQLite works best with limited concurrency due to file locking
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
 
 	// Create table
 	createTableSQL := `

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -796,6 +797,12 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 		runtime.EventsEmit(a.ctx, "sync:complete", map[string]any{
 			"count": count,
 		})
+
+		// Force memory release after initial sync
+		// This returns unused memory to OS, reducing process footprint
+		goruntime.GC()
+		debug.FreeOSMemory()
+		logMemoryStats("StartWatch-AfterGC")
 	}()
 
 	// Background goroutine: wait for all event forwarders to finish
