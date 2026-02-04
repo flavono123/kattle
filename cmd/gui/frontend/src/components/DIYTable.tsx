@@ -298,17 +298,23 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
     }
   );
 
+  // Convert previewField from string[] to dot notation for the hook
+  const previewFieldPath = previewField ? previewField.join('.') : undefined;
+
   // Use standard data fetching for small datasets
   const standardResult = useResourceData(
     !useWindowedMode ? selectedGVK : null,
     !useWindowedMode ? connectedContexts : [],
-    { watch: true, selectedFields: selectedFieldPaths }
+    { watch: true, selectedFields: selectedFieldPaths, previewField: previewFieldPath }
   );
 
   // Unified interface
   const loading = useWindowedMode ? windowedResult.loading : standardResult.loading;
+  const watchStatus = useWindowedMode ? windowedResult.watchStatus : standardResult.watchStatus;
   const totalCount = useWindowedMode ? windowedResult.totalCount : standardResult.data.length;
   const changedCells = useWindowedMode ? [] : standardResult.changedCells;  // No cell flashing in windowed mode
+  const loadingFields = useWindowedMode ? new Set<string>() : standardResult.loadingFields;  // Cell-level skeleton for loading fields
+  const extractedFields = useWindowedMode ? new Set<string>() : standardResult.extractedFields;  // Fields extracted from backend
 
   // For windowed mode, create virtual data array with actual data where loaded
   // TanStack Table needs this for row model creation
@@ -776,9 +782,19 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
               Loading {pluralize(selectedGVK?.kind?.toLowerCase() ?? 'resource')}...
             </p>
           </div>
-        ) : data.length === 0 ? (
+        ) : data.length === 0 && watchStatus === 'connected' ? (
+          // Only show "No resources found" when fully connected
+          // This prevents brief flash during reconnection/field changes
           <div className="h-full flex items-center justify-center">
             <p className="text-sm text-muted-foreground">No resources found</p>
+          </div>
+        ) : data.length === 0 ? (
+          // Still connecting or reconnecting - show loading state
+          <div className="h-full flex flex-col items-center justify-center gap-2">
+            <Spinner className="w-8 h-8" />
+            <p className="text-sm text-muted-foreground">
+              Loading {pluralize(selectedGVK?.kind?.toLowerCase() ?? 'resource')}...
+            </p>
           </div>
         ) : rows.length === 0 ? (
           <div className="h-full flex items-center justify-center">
@@ -930,8 +946,37 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
                       const isPreviewCell = cell.column.id.startsWith('_preview.');
                       const isColumnHighlighted = highlightedColumnPath && cell.column.id === highlightedColumnPath.join('.');
 
-                      // Get cell value and highlight indices for direct rendering
+                      // Get cell value first (needed for skeleton decision)
                       const value = cell.getValue();
+
+                      // Get the actual field path (strip _preview. prefix for preview columns)
+                      const fieldPath = isPreviewCell
+                        ? cell.column.id.replace('_preview.', '')
+                        : cell.column.id;
+
+                      // Essential metadata fields (always extracted by backend, no skeleton needed)
+                      // These match essentialFieldPaths in app.go
+                      const essentialFieldPrefixes = [
+                        'metadata.name', 'metadata.namespace', 'metadata.uid',
+                        'metadata.resourceVersion', 'metadata.creationTimestamp',
+                        'metadata.labels', 'metadata.ownerReferences',
+                        'metadata.deletionTimestamp', 'metadata.finalizers',
+                        '_context', // special field for multi-context
+                      ];
+                      const isEssentialField = essentialFieldPrefixes.some(
+                        prefix => fieldPath === prefix || fieldPath.startsWith(prefix + '.')
+                      );
+
+                      // Field is considered "extracted" if it's essential OR in extractedFields set
+                      const isFieldExtracted = isEssentialField || extractedFields.has(fieldPath);
+
+                      // Show skeleton when:
+                      // 1. Field is in loadingFields (actively being fetched) AND value doesn't exist yet
+                      // 2. Field is not extracted yet AND value is undefined (not fetched from backend)
+                      // Note: null values are real data (field exists but has no value), not loading state
+                      // If value already exists (from previous selection), show it immediately instead of skeleton
+                      const showSkeleton = (loadingFields.has(fieldPath) && value === undefined) ||
+                        (!isFieldExtracted && value === undefined);
                       const fullText = typeof value === 'object' && value !== null
                         ? JSON.stringify(value)
                         : String(value ?? '');
@@ -956,13 +1001,18 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
                             setFocusedColIndex(cellIndex);
                           }}
                         >
-                          <CellContent
-                            value={value}
-                            highlightIndices={highlightIndices}
-                            isFocused={isCellFocused}
-                            showPopover={showCellPopover}
-                            showCopied={showCopied}
-                          />
+                          {showSkeleton ? (
+                            // Skeleton for loading fields or preview cells without data
+                            <div className="h-4 bg-muted/50 rounded animate-pulse w-3/4" />
+                          ) : (
+                            <CellContent
+                              value={value}
+                              highlightIndices={highlightIndices}
+                              isFocused={isCellFocused}
+                              showPopover={showCellPopover}
+                              showCopied={showCopied}
+                            />
+                          )}
                         </div>
                       );
                     })}

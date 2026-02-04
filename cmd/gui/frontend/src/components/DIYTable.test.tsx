@@ -27,6 +27,8 @@ vi.mock('../hooks/useResourceData', () => ({
     watchStatus: 'connected',
     getRowId: (row: any) => `${row._context}/${row.metadata.namespace}/${row.metadata.name}`,
     changedCells: [],
+    loadingFields: new Set<string>(),
+    extractedFields: new Set<string>(),
   })),
 }));
 

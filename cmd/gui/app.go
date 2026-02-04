@@ -40,12 +40,20 @@ type App struct {
 	favoriteStore *store.Store
 
 	// Watch state
-	watchMu     sync.RWMutex
-	controllers []*watchController
-	stopChs     []chan struct{}
-	watchDone   chan struct{}
-	fieldStore  *kube.FieldStore // key: "context/namespace/name" → value: extracted fields
-	sqlStore    *kube.SQLStore   // SQLite-based store (enabled via KATTLE_USE_SQLSTORE=1)
+	watchMu         sync.RWMutex
+	controllers     []*watchController
+	stopChs         []chan struct{}
+	watchDone       chan struct{}
+	fieldStore      *kube.FieldStore    // key: "context/namespace/name" → value: extracted fields
+	sqlStore        *kube.SQLStore      // SQLite-based store (enabled via KATTLE_USE_SQLSTORE=1)
+	extractedFields map[string]struct{} // fields that were extracted during initial sync (for SQLStore mode)
+}
+
+// SetSelectedFieldsResult is the return type for SetSelectedFields
+type SetSelectedFieldsResult struct {
+	// NeedsResync is true if the watch needs to be restarted to fetch newly selected fields.
+	// This happens in SQLStore mode when new fields are added that weren't extracted during initial sync.
+	NeedsResync bool `json:"needsResync"`
 }
 
 // watchController wraps a ResourceController with context info
@@ -549,6 +557,16 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 		a.fieldStore.SetSelectedFields(selectedFields)
 	}
 
+	// Track which fields will be extracted (essential + selected)
+	// Used by SetSelectedFields to determine if resync is needed
+	a.extractedFields = make(map[string]struct{})
+	for _, p := range essentialFieldPaths {
+		a.extractedFields[p] = struct{}{}
+	}
+	for _, p := range selectedFields {
+		a.extractedFields[p] = struct{}{}
+	}
+
 	// Clear SQLStore if it exists (parallel operation mode)
 	if a.sqlStore != nil {
 		if err := a.sqlStore.Clear(); err != nil {
@@ -848,15 +866,30 @@ func (a *App) StopWatch() {
 // SetSelectedFields updates the fields to extract for table display.
 // Called by frontend when user changes column selection.
 // Fields should be dot-notation paths like "status.phase", "spec.replicas".
-func (a *App) SetSelectedFields(fields []string) {
-	// Get fieldStore reference under lock to avoid race with StopWatch
-	a.watchMu.RLock()
-	fs := a.fieldStore
-	a.watchMu.RUnlock()
+// Returns SetSelectedFieldsResult with NeedsResync=true if watch restart is required.
+func (a *App) SetSelectedFields(fields []string) SetSelectedFieldsResult {
+	a.watchMu.Lock()
+	defer a.watchMu.Unlock()
 
+	fs := a.fieldStore
 	if fs != nil {
 		fs.SetSelectedFields(fields)
 	}
+
+	// In SQLStore mode, check if any new fields were added that weren't extracted
+	// If so, we need to resync because SQLStore only has the originally extracted fields
+	needsResync := false
+	if useSQLStore && a.extractedFields != nil {
+		for _, field := range fields {
+			if _, exists := a.extractedFields[field]; !exists {
+				log.Printf("[DEBUG] SetSelectedFields: field %q not in extractedFields, needs resync", field)
+				needsResync = true
+				break
+			}
+		}
+	}
+
+	return SetSelectedFieldsResult{NeedsResync: needsResync}
 }
 
 // GetResourcesByKeys fetches resources by keys (Pull Model)

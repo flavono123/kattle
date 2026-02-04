@@ -40,7 +40,7 @@ export function SaveFavoriteView(arg1:string,arg2:string,arg3:string,arg4:string
 
 export function SaveFile(arg1:string,arg2:string):Promise<string>;
 
-export function SetSelectedFields(arg1:Array<string>):Promise<void>;
+export function SetSelectedFields(arg1:Array<string>):Promise<main.SetSelectedFieldsResult>;
 
 export function StartWatch(arg1:main.MultiClusterGVK,arg2:Array<string>,arg3:Array<string>):Promise<void>;
 
