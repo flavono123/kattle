@@ -26,7 +26,14 @@ import (
 
 // useSQLStore determines whether to use SQLStore instead of FieldStore.
 // Set KATTLE_USE_SQLSTORE=1 environment variable to enable.
+// When enabled, frontend should also use windowed mode for memory optimization.
 var useSQLStore = os.Getenv("KATTLE_USE_SQLSTORE") == "1"
+
+// IsWindowedModeEnabled returns whether windowed mode should be used.
+// This is tied to SQLStore - if SQLStore is enabled, windowed mode should be too.
+func (a *App) IsWindowedModeEnabled() bool {
+	return useSQLStore
+}
 
 // logMemoryStats logs current goroutine count and event metrics for debugging
 func logMemoryStats(label string) {
@@ -1040,6 +1047,58 @@ func (a *App) GetResourcesRange(start, end int, sortField string, sortDesc bool)
 		}
 	}
 	return result
+}
+
+// GetResourcesRangeFiltered returns resources with filtering, sorting, and pagination.
+// This is the main API for windowed mode with full query support.
+// paramsJSON: JSON-encoded kube.QueryParams
+func (a *App) GetResourcesRangeFiltered(paramsJSON string) ([]map[string]any, error) {
+	var params kube.QueryParams
+	if err := json.Unmarshal([]byte(paramsJSON), &params); err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
+
+	a.watchMu.RLock()
+	defer a.watchMu.RUnlock()
+
+	if !useSQLStore || a.sqlStore == nil {
+		return nil, fmt.Errorf("SQLStore not enabled - set KATTLE_USE_SQLSTORE=1")
+	}
+
+	result, err := a.sqlStore.GetRangeWithFilters(params)
+	if err != nil {
+		return nil, fmt.Errorf("GetRangeWithFilters failed: %w", err)
+	}
+
+	log.Printf("[DEBUG] GetResourcesRangeFiltered: returning %d rows (search=%q, filters=%d)",
+		len(result), params.Search, len(params.Filters))
+	return result, nil
+}
+
+// GetResourceCountFiltered returns total count with filters applied.
+// Used for virtual scrollbar calculation in windowed mode.
+// paramsJSON: JSON-encoded kube.QueryParams (only Search and Filters are used)
+func (a *App) GetResourceCountFiltered(paramsJSON string) (int, error) {
+	var params kube.QueryParams
+	if err := json.Unmarshal([]byte(paramsJSON), &params); err != nil {
+		return 0, fmt.Errorf("invalid params: %w", err)
+	}
+
+	a.watchMu.RLock()
+	defer a.watchMu.RUnlock()
+
+	if !useSQLStore || a.sqlStore == nil {
+		return 0, fmt.Errorf("SQLStore not enabled - set KATTLE_USE_SQLSTORE=1")
+	}
+
+	count, err := a.sqlStore.CountWithFilters(params)
+	if err != nil {
+		return 0, fmt.Errorf("CountWithFilters failed: %w", err)
+	}
+
+	log.Printf("[DEBUG] GetResourceCountFiltered: %d (search=%q, filters=%d)",
+		count, params.Search, len(params.Filters))
+	return count, nil
 }
 
 // convertNodeTree converts kube.Node map to frontend TreeNode array

@@ -12,6 +12,37 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// FilterOp represents a filter operation for SQL queries.
+type FilterOp string
+
+const (
+	FilterOpContains   FilterOp = "contains"   // LIKE %value%
+	FilterOpEquals     FilterOp = "equals"     // = value
+	FilterOpStartsWith FilterOp = "startsWith" // LIKE value%
+	FilterOpGt         FilterOp = "gt"         // > value
+	FilterOpLt         FilterOp = "lt"         // < value
+	FilterOpGte        FilterOp = "gte"        // >= value
+	FilterOpLte        FilterOp = "lte"        // <= value
+	FilterOpIn         FilterOp = "in"         // IN (values)
+)
+
+// Filter represents a single filter condition.
+type Filter struct {
+	Field string   `json:"field"` // JSON path: "metadata.namespace"
+	Op    FilterOp `json:"op"`
+	Value any      `json:"value"` // string, number, or []string for "in"
+}
+
+// QueryParams contains all query parameters for filtered range queries.
+type QueryParams struct {
+	Start     int      `json:"start"`
+	End       int      `json:"end"`
+	SortField string   `json:"sortField"`
+	SortDesc  bool     `json:"sortDesc"`
+	Filters   []Filter `json:"filters"` // AND combination
+	Search    string   `json:"search"`  // Global search term
+}
+
 // SQLStore stores extracted field values for resources in SQLite.
 // This replaces FieldStore to reduce memory usage by moving data to disk.
 type SQLStore struct {
@@ -292,6 +323,70 @@ func isValidSortField(field string) bool {
 	return true
 }
 
+// escapeLike escapes special characters for LIKE queries.
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
+}
+
+// buildFilterClause builds a SQL WHERE clause for a single filter.
+// Returns the clause string and arguments for prepared statement.
+func buildFilterClause(f Filter) (string, []any) {
+	if !isValidSortField(f.Field) {
+		return "", nil
+	}
+
+	jsonPath := fmt.Sprintf("json_extract(data, '$.%s')", f.Field)
+
+	switch f.Op {
+	case FilterOpContains:
+		if strVal, ok := f.Value.(string); ok {
+			return fmt.Sprintf("%s LIKE ? ESCAPE '\\'", jsonPath),
+				[]any{"%" + escapeLike(strVal) + "%"}
+		}
+	case FilterOpEquals:
+		return fmt.Sprintf("%s = ?", jsonPath), []any{f.Value}
+	case FilterOpStartsWith:
+		if strVal, ok := f.Value.(string); ok {
+			return fmt.Sprintf("%s LIKE ? ESCAPE '\\'", jsonPath),
+				[]any{escapeLike(strVal) + "%"}
+		}
+	case FilterOpGt:
+		return fmt.Sprintf("%s > ?", jsonPath), []any{f.Value}
+	case FilterOpLt:
+		return fmt.Sprintf("%s < ?", jsonPath), []any{f.Value}
+	case FilterOpGte:
+		return fmt.Sprintf("%s >= ?", jsonPath), []any{f.Value}
+	case FilterOpLte:
+		return fmt.Sprintf("%s <= ?", jsonPath), []any{f.Value}
+	case FilterOpIn:
+		// Handle []any from JSON unmarshal
+		var values []string
+		switch v := f.Value.(type) {
+		case []string:
+			values = v
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					values = append(values, s)
+				}
+			}
+		}
+		if len(values) > 0 {
+			placeholders := make([]string, len(values))
+			args := make([]any, len(values))
+			for i, val := range values {
+				placeholders[i] = "?"
+				args[i] = val
+			}
+			return fmt.Sprintf("%s IN (%s)", jsonPath, strings.Join(placeholders, ",")), args
+		}
+	}
+	return "", nil
+}
+
 // GetRange returns rows for the given range (0-indexed) with optional sorting.
 // sortField: JSON field path to sort by (e.g., "metadata.name", "metadata.creationTimestamp")
 // sortDesc: true for descending order
@@ -356,6 +451,129 @@ func (s *SQLStore) GetRange(start, end int, sortField string, sortDesc bool) ([]
 	}
 
 	return result, nil
+}
+
+// buildWhereClause builds WHERE clause from QueryParams.
+// Returns the WHERE SQL string (including "WHERE" keyword if needed) and arguments.
+func buildWhereClause(params QueryParams) (string, []any) {
+	var whereClauses []string
+	var args []any
+
+	// Global search (name, namespace, status.phase)
+	if params.Search != "" {
+		searchPattern := "%" + escapeLike(params.Search) + "%"
+		whereClauses = append(whereClauses, `(
+			name LIKE ? ESCAPE '\' OR
+			namespace LIKE ? ESCAPE '\' OR
+			json_extract(data, '$.status.phase') LIKE ? ESCAPE '\'
+		)`)
+		args = append(args, searchPattern, searchPattern, searchPattern)
+	}
+
+	// Individual filters (AND combination)
+	for _, f := range params.Filters {
+		clause, filterArgs := buildFilterClause(f)
+		if clause != "" {
+			whereClauses = append(whereClauses, clause)
+			args = append(args, filterArgs...)
+		}
+	}
+
+	if len(whereClauses) == 0 {
+		return "", nil
+	}
+
+	return "WHERE " + strings.Join(whereClauses, " AND "), args
+}
+
+// buildOrderByClause builds ORDER BY clause from sort parameters.
+func buildOrderByClause(sortField string, sortDesc bool) string {
+	if sortField == "" || !isValidSortField(sortField) {
+		return "name ASC"
+	}
+
+	jsonPath := fmt.Sprintf("json_extract(data, '$.%s')", sortField)
+	direction := "ASC"
+	if sortDesc {
+		direction = "DESC"
+	}
+	return fmt.Sprintf("%s %s", jsonPath, direction)
+}
+
+// GetRangeWithFilters returns rows matching filters with pagination and sorting.
+// This is the primary method for windowed mode with full query support.
+func (s *SQLStore) GetRangeWithFilters(params QueryParams) ([]map[string]any, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	limit := params.End - params.Start
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	whereSQL, whereArgs := buildWhereClause(params)
+	orderBy := buildOrderByClause(params.SortField, params.SortDesc)
+
+	query := fmt.Sprintf(`
+		SELECT key, context, data FROM resources
+		%s
+		ORDER BY %s
+		LIMIT ? OFFSET ?
+	`, whereSQL, orderBy)
+
+	// Append LIMIT and OFFSET to args
+	args := append(whereArgs, limit, params.Start)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query range with filters: %w", err)
+	}
+	defer rows.Close()
+
+	result := make([]map[string]any, 0, limit)
+	for rows.Next() {
+		var key, context string
+		var data []byte
+		if err := rows.Scan(&key, &context, &data); err != nil {
+			log.Printf("Warning: failed to scan row: %v", err)
+			continue
+		}
+
+		var obj map[string]any
+		if err := json.Unmarshal(data, &obj); err != nil {
+			log.Printf("Warning: failed to unmarshal data for %s: %v", key, err)
+			continue
+		}
+
+		obj["_context"] = context
+		obj["_key"] = key
+		result = append(result, obj)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	return result, nil
+}
+
+// CountWithFilters returns total count matching filters.
+// Used for virtual scrollbar calculation in windowed mode.
+func (s *SQLStore) CountWithFilters(params QueryParams) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	whereSQL, whereArgs := buildWhereClause(params)
+
+	query := fmt.Sprintf("SELECT COUNT(*) FROM resources %s", whereSQL)
+
+	var count int
+	err := s.db.QueryRow(query, whereArgs...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count with filters: %w", err)
+	}
+
+	return count, nil
 }
 
 // Close closes the database connection and releases all resources.

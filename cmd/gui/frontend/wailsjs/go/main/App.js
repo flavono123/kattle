@@ -38,6 +38,10 @@ export function GetResourceCount() {
   return window['go']['main']['App']['GetResourceCount']();
 }
 
+export function GetResourceCountFiltered(arg1) {
+  return window['go']['main']['App']['GetResourceCountFiltered'](arg1);
+}
+
 export function GetResources(arg1, arg2) {
   return window['go']['main']['App']['GetResources'](arg1, arg2);
 }
@@ -50,8 +54,16 @@ export function GetResourcesRange(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['GetResourcesRange'](arg1, arg2, arg3, arg4);
 }
 
+export function GetResourcesRangeFiltered(arg1) {
+  return window['go']['main']['App']['GetResourcesRangeFiltered'](arg1);
+}
+
 export function Greet(arg1) {
   return window['go']['main']['App']['Greet'](arg1);
+}
+
+export function IsWindowedModeEnabled() {
+  return window['go']['main']['App']['IsWindowedModeEnabled']();
 }
 
 export function ListContexts() {

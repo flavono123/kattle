@@ -20,13 +20,19 @@ export function GetNodeTree(arg1:main.MultiClusterGVK,arg2:Array<string>):Promis
 
 export function GetResourceCount():Promise<number>;
 
+export function GetResourceCountFiltered(arg1:string):Promise<number>;
+
 export function GetResources(arg1:main.MultiClusterGVK,arg2:Array<string>):Promise<Array<Record<string, any>>>;
 
 export function GetResourcesByKeys(arg1:Array<string>):Promise<Array<Record<string, any>>>;
 
 export function GetResourcesRange(arg1:number,arg2:number,arg3:string,arg4:boolean):Promise<Array<Record<string, any>>>;
 
+export function GetResourcesRangeFiltered(arg1:string):Promise<Array<Record<string, any>>>;
+
 export function Greet(arg1:string):Promise<string>;
+
+export function IsWindowedModeEnabled():Promise<boolean>;
 
 export function ListContexts():Promise<Array<string>>;
 

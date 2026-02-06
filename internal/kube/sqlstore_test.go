@@ -410,3 +410,241 @@ func TestSQLStore_GetRange(t *testing.T) {
 		assert.NotEmpty(t, result[0]["_key"])
 	})
 }
+
+func TestSQLStore_GetRangeWithFilters(t *testing.T) {
+	store, err := NewSQLStore(":memory:")
+	require.NoError(t, err)
+	defer store.Close()
+
+	// Setup: insert test data with various namespaces and status
+	testData := []struct {
+		key       string
+		namespace string
+		name      string
+		status    string
+	}{
+		{"ctx/ns-a/pod-1", "ns-a", "pod-1", "Running"},
+		{"ctx/ns-a/pod-2", "ns-a", "pod-2", "Pending"},
+		{"ctx/ns-b/pod-3", "ns-b", "pod-3", "Running"},
+		{"ctx/ns-b/pod-4", "ns-b", "pod-4", "Failed"},
+		{"ctx/ns-c/pod-5", "ns-c", "pod-5", "Running"},
+	}
+
+	for _, td := range testData {
+		data, _ := json.Marshal(map[string]any{
+			"metadata": map[string]any{
+				"name":      td.name,
+				"namespace": td.namespace,
+			},
+			"status": map[string]any{
+				"phase": td.status,
+			},
+		})
+		err := store.Upsert(td.key, "ctx", td.namespace, td.name, data)
+		require.NoError(t, err)
+	}
+
+	t.Run("no filters returns all", func(t *testing.T) {
+		params := QueryParams{Start: 0, End: 10}
+		result, err := store.GetRangeWithFilters(params)
+		require.NoError(t, err)
+		assert.Len(t, result, 5)
+	})
+
+	t.Run("global search by name", func(t *testing.T) {
+		params := QueryParams{Start: 0, End: 10, Search: "pod-1"}
+		result, err := store.GetRangeWithFilters(params)
+		require.NoError(t, err)
+		assert.Len(t, result, 1)
+		meta := result[0]["metadata"].(map[string]any)
+		assert.Equal(t, "pod-1", meta["name"])
+	})
+
+	t.Run("global search by namespace", func(t *testing.T) {
+		params := QueryParams{Start: 0, End: 10, Search: "ns-a"}
+		result, err := store.GetRangeWithFilters(params)
+		require.NoError(t, err)
+		assert.Len(t, result, 2)
+	})
+
+	t.Run("global search by status.phase", func(t *testing.T) {
+		params := QueryParams{Start: 0, End: 10, Search: "Running"}
+		result, err := store.GetRangeWithFilters(params)
+		require.NoError(t, err)
+		assert.Len(t, result, 3) // pod-1, pod-3, pod-5
+	})
+
+	t.Run("filter by equals", func(t *testing.T) {
+		params := QueryParams{
+			Start: 0, End: 10,
+			Filters: []Filter{
+				{Field: "status.phase", Op: FilterOpEquals, Value: "Failed"},
+			},
+		}
+		result, err := store.GetRangeWithFilters(params)
+		require.NoError(t, err)
+		assert.Len(t, result, 1)
+		status := result[0]["status"].(map[string]any)
+		assert.Equal(t, "Failed", status["phase"])
+	})
+
+	t.Run("filter by contains", func(t *testing.T) {
+		params := QueryParams{
+			Start: 0, End: 10,
+			Filters: []Filter{
+				{Field: "metadata.namespace", Op: FilterOpContains, Value: "-a"},
+			},
+		}
+		result, err := store.GetRangeWithFilters(params)
+		require.NoError(t, err)
+		assert.Len(t, result, 2) // ns-a
+	})
+
+	t.Run("filter by startsWith", func(t *testing.T) {
+		params := QueryParams{
+			Start: 0, End: 10,
+			Filters: []Filter{
+				{Field: "metadata.name", Op: FilterOpStartsWith, Value: "pod-"},
+			},
+		}
+		result, err := store.GetRangeWithFilters(params)
+		require.NoError(t, err)
+		assert.Len(t, result, 5) // all pods
+	})
+
+	t.Run("filter by in", func(t *testing.T) {
+		params := QueryParams{
+			Start: 0, End: 10,
+			Filters: []Filter{
+				{Field: "metadata.namespace", Op: FilterOpIn, Value: []string{"ns-a", "ns-c"}},
+			},
+		}
+		result, err := store.GetRangeWithFilters(params)
+		require.NoError(t, err)
+		assert.Len(t, result, 3) // ns-a (2) + ns-c (1)
+	})
+
+	t.Run("multiple filters (AND)", func(t *testing.T) {
+		params := QueryParams{
+			Start: 0, End: 10,
+			Filters: []Filter{
+				{Field: "metadata.namespace", Op: FilterOpEquals, Value: "ns-a"},
+				{Field: "status.phase", Op: FilterOpEquals, Value: "Running"},
+			},
+		}
+		result, err := store.GetRangeWithFilters(params)
+		require.NoError(t, err)
+		assert.Len(t, result, 1) // only pod-1
+	})
+
+	t.Run("search with filter combined", func(t *testing.T) {
+		params := QueryParams{
+			Start:  0,
+			End:    10,
+			Search: "Running",
+			Filters: []Filter{
+				{Field: "metadata.namespace", Op: FilterOpEquals, Value: "ns-b"},
+			},
+		}
+		result, err := store.GetRangeWithFilters(params)
+		require.NoError(t, err)
+		assert.Len(t, result, 1) // pod-3 (ns-b + Running)
+	})
+
+	t.Run("pagination with filters", func(t *testing.T) {
+		params := QueryParams{
+			Start:  0,
+			End:    2,
+			Search: "Running",
+		}
+		result, err := store.GetRangeWithFilters(params)
+		require.NoError(t, err)
+		assert.Len(t, result, 2) // first 2 of 3 Running pods
+	})
+
+	t.Run("sorting with filters", func(t *testing.T) {
+		params := QueryParams{
+			Start:     0,
+			End:       10,
+			Search:    "Running",
+			SortField: "metadata.name",
+			SortDesc:  true,
+		}
+		result, err := store.GetRangeWithFilters(params)
+		require.NoError(t, err)
+		assert.Len(t, result, 3)
+		// Descending: pod-5, pod-3, pod-1
+		meta0 := result[0]["metadata"].(map[string]any)
+		meta2 := result[2]["metadata"].(map[string]any)
+		assert.Equal(t, "pod-5", meta0["name"])
+		assert.Equal(t, "pod-1", meta2["name"])
+	})
+}
+
+func TestSQLStore_CountWithFilters(t *testing.T) {
+	store, err := NewSQLStore(":memory:")
+	require.NoError(t, err)
+	defer store.Close()
+
+	// Setup: insert test data
+	for i := 0; i < 10; i++ {
+		ns := "ns-a"
+		if i >= 6 {
+			ns = "ns-b"
+		}
+		data, _ := json.Marshal(map[string]any{
+			"metadata": map[string]any{
+				"name":      fmt.Sprintf("pod-%d", i),
+				"namespace": ns,
+			},
+		})
+		key := fmt.Sprintf("ctx/%s/pod-%d", ns, i)
+		err := store.Upsert(key, "ctx", ns, fmt.Sprintf("pod-%d", i), data)
+		require.NoError(t, err)
+	}
+
+	t.Run("no filters", func(t *testing.T) {
+		params := QueryParams{}
+		count, err := store.CountWithFilters(params)
+		require.NoError(t, err)
+		assert.Equal(t, 10, count)
+	})
+
+	t.Run("with search", func(t *testing.T) {
+		params := QueryParams{Search: "ns-a"}
+		count, err := store.CountWithFilters(params)
+		require.NoError(t, err)
+		assert.Equal(t, 6, count) // pod-0 to pod-5
+	})
+
+	t.Run("with filter", func(t *testing.T) {
+		params := QueryParams{
+			Filters: []Filter{
+				{Field: "metadata.namespace", Op: FilterOpEquals, Value: "ns-b"},
+			},
+		}
+		count, err := store.CountWithFilters(params)
+		require.NoError(t, err)
+		assert.Equal(t, 4, count) // pod-6 to pod-9
+	})
+}
+
+func TestEscapeLike(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"normal", "normal"},
+		{"with%percent", `with\%percent`},
+		{"with_underscore", `with\_underscore`},
+		{`with\backslash`, `with\\backslash`},
+		{"all%_\\special", `all\%\_\\special`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := escapeLike(tt.input)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}

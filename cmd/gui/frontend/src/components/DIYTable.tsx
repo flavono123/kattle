@@ -295,6 +295,7 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
       selectedFields: selectedFieldPaths,
       sort: serverSort,
       overscan: 30,
+      search: globalFilter,  // Server-side search
     }
   );
 
@@ -310,7 +311,9 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
 
   // Unified interface
   const loading = useWindowedMode ? windowedResult.loading : standardResult.loading;
+  const filterPending = useWindowedMode ? windowedResult.filterPending : false;
   const watchStatus = useWindowedMode ? windowedResult.watchStatus : standardResult.watchStatus;
+  const initialSyncComplete = useWindowedMode ? windowedResult.initialSyncComplete : true;  // Standard mode always synced
   const totalCount = useWindowedMode ? windowedResult.totalCount : standardResult.data.length;
   const changedCells = useWindowedMode ? [] : standardResult.changedCells;  // No cell flashing in windowed mode
   const loadingFields = useWindowedMode ? new Set<string>() : standardResult.loadingFields;  // Cell-level skeleton for loading fields
@@ -588,10 +591,10 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
     manualSorting: useWindowedMode,  // Server-side sorting in windowed mode
     manualFiltering: useWindowedMode,  // Server-side filtering in windowed mode
     state: {
-      globalFilter: useWindowedMode ? '' : globalFilter,  // Disable filter in windowed mode
+      globalFilter,  // Keep filter state for UI, server handles filtering in windowed mode
       sorting,
     },
-    onGlobalFilterChange: useWindowedMode ? undefined : setGlobalFilter,
+    onGlobalFilterChange: setGlobalFilter,  // Allow filter changes in both modes
     onSortingChange: setSorting,
     getCoreRowModel: getCoreRowModel(),
     getFilteredRowModel: useWindowedMode ? undefined : getFilteredRowModel(),
@@ -757,6 +760,7 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
         onGlobalFilterChange={setGlobalFilter}
         filteredRowCount={rows.length}
         totalRowCount={data.length}
+        isLoading={loading || filterPending || (useWindowedMode && !initialSyncComplete)}
         headers={exportData.headers}
         rows={exportData.rows}
         resourceKind={selectedGVK?.kind || 'resources'}
@@ -775,21 +779,21 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
           setFocusedColIndex(null);
         }}
       >
-        {loading ? (
+        {loading && (!useWindowedMode || totalCount === 0) ? (
           <div className="h-full flex flex-col items-center justify-center gap-2">
             <Spinner className="w-8 h-8" />
             <p className="text-sm text-muted-foreground">
               Loading {pluralize(selectedGVK?.kind?.toLowerCase() ?? 'resource')}...
             </p>
           </div>
-        ) : data.length === 0 && watchStatus === 'connected' ? (
-          // Only show "No resources found" when fully connected
-          // This prevents brief flash during reconnection/field changes
+        ) : data.length === 0 && watchStatus === 'connected' && initialSyncComplete ? (
+          // Only show "No resources found" when fully connected AND initial sync is complete
+          // This prevents brief flash during initial load and reconnection
           <div className="h-full flex items-center justify-center">
             <p className="text-sm text-muted-foreground">No resources found</p>
           </div>
         ) : data.length === 0 ? (
-          // Still connecting or reconnecting - show loading state
+          // Still connecting, reconnecting, or waiting for initial sync - show loading state
           <div className="h-full flex flex-col items-center justify-center gap-2">
             <Spinner className="w-8 h-8" />
             <p className="text-sm text-muted-foreground">
