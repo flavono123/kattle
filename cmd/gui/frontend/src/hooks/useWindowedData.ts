@@ -3,6 +3,7 @@ import { EventsOn } from '../../wailsjs/runtime/runtime';
 import {
   StartWatch,
   StopWatch,
+  SetSelectedFields,
   GetResourceCount,
   GetResourcesRange,
   GetResourceCountFiltered,
@@ -51,6 +52,8 @@ export interface UseWindowedDataOptions {
   search?: string;
   /** Column filters (server-side filtering) */
   filters?: Filter[];
+  /** Preview field path (hover preview, debounced 200ms) */
+  previewField?: string;
 }
 
 export interface UseWindowedDataResult {
@@ -76,6 +79,8 @@ export interface UseWindowedDataResult {
   onVisibleRangeChange: (startIndex: number, endIndex: number) => void;
   /** Current fetch range (for debugging) */
   fetchRange: { start: number; end: number };
+  /** Whether async field extraction is in progress (cache miss) */
+  extractingFields: boolean;
   /** Manual refresh */
   refresh: () => void;
 }
@@ -101,6 +106,7 @@ export function useWindowedData(
     sort,
     search = '',
     filters = [],
+    previewField,
   } = options;
 
   const selectedFieldsKey = JSON.stringify(selectedFields);
@@ -130,6 +136,18 @@ export function useWindowedData(
   const [error, setError] = useState<Error | null>(null);
   const [watchStatus, setWatchStatus] = useState<WatchStatus>('disconnected');
   const [initialSyncComplete, setInitialSyncComplete] = useState(false);
+  const [extractingFields, setExtractingFields] = useState(false);
+
+  // Debounced preview field (200ms delay for hover)
+  const [debouncedPreview, setDebouncedPreview] = useState<string | undefined>();
+  useEffect(() => {
+    if (!previewField) {
+      setDebouncedPreview(undefined);
+      return;
+    }
+    const timer = setTimeout(() => setDebouncedPreview(previewField), 200);
+    return () => clearTimeout(timer);
+  }, [previewField]);
 
   // Refs for mutable state
   const watchGenRef = useRef(0);
@@ -137,6 +155,8 @@ export function useWindowedData(
   const pendingFetchRef = useRef(false);
   const lastFetchRangeRef = useRef({ start: -1, end: -1 });
   const fetchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Stable ref to fetchRange_ — updated each render, used in effects to avoid stale closures
+  const fetchRangeRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
   // Computed fetch range (visible + overscan)
   const fetchRange = useMemo(() => ({
@@ -262,19 +282,23 @@ export function useWindowedData(
     }
 
     const watchGen = ++watchGenRef.current;
+
     setError(null);
-    setLoading(true);
     setWatchStatus('connecting');
-    setVisibleRows(new Map());
     setInitialSyncComplete(false);  // Reset sync state on new watch
     lastFetchRangeRef.current = { start: -1, end: -1 };
 
-    // Start watch
+    // Full restart (GVK/context change) - clear everything
+    setLoading(true);
+    setVisibleRows(new Map());
+
+    // Start watch with current selectedFields
+    const fieldsToUse = [...selectedFields];
     StopWatch()
       .catch(() => {})
       .then(() => {
         if (watchGen !== watchGenRef.current) return;
-        return StartWatch(gvk, contexts, selectedFields);
+        return StartWatch(gvk, contexts, fieldsToUse);
       })
       .then(() => {
         if (watchGen !== watchGenRef.current) return;
@@ -300,8 +324,8 @@ export function useWindowedData(
       if (data.count === 0) {
         setLoading(false);
       } else {
-        // Fetch initial visible range
-        fetchRange_();
+        // Fetch initial visible range (use ref to avoid stale closure)
+        fetchRangeRef.current();
       }
     });
 
@@ -312,18 +336,20 @@ export function useWindowedData(
       // Refresh count on add/delete
       if (event.type === 'ADDED' || event.type === 'DELETED') {
         try {
+          // Use paramsRef to get current search/filter values (avoids stale closure)
+          const currentParams = paramsRef.current;
           let count: number;
-          if (debouncedSearch || filters.length > 0) {
+          if (currentParams.debouncedSearch || currentParams.filters.length > 0) {
             // Use filtered count when filters are active
-            const params: QueryParams = {
+            const queryParams: QueryParams = {
               start: 0,
               end: 0,
               sortField: '',
               sortDesc: false,
-              filters: filters,
-              search: debouncedSearch,
+              filters: currentParams.filters,
+              search: currentParams.debouncedSearch,
             };
-            count = await GetResourceCountFiltered(JSON.stringify(params));
+            count = await GetResourceCountFiltered(JSON.stringify(queryParams));
           } else {
             count = await GetResourceCount();
           }
@@ -338,7 +364,13 @@ export function useWindowedData(
       // Re-fetch visible range (data might have changed)
       // Reset last fetch range to force re-fetch
       lastFetchRangeRef.current = { start: -1, end: -1 };
-      scheduleFetch();
+      // Use ref-based fetch to avoid stale scheduleFetch/fetchRange_ closure
+      if (fetchTimeoutRef.current) {
+        clearTimeout(fetchTimeoutRef.current);
+      }
+      fetchTimeoutRef.current = setTimeout(() => {
+        fetchRangeRef.current();
+      }, fetchInterval);
     });
 
     return () => {
@@ -349,7 +381,7 @@ export function useWindowedData(
       }
       setWatchStatus('disconnected');
     };
-  }, [gvk, contexts, selectedFieldsKey]);  // Sort/search/filters handled by re-fetch effect
+  }, [gvk, contexts]);  // selectedFields via SetSelectedFields effect; sort/search/filters by re-fetch effect
 
   // Cleanup on unmount
   useEffect(() => {
@@ -358,11 +390,74 @@ export function useWindowedData(
     };
   }, []);
 
+  // Handle selectedFields + previewField changes via backend cache
+  // Backend SetSelectedFields handles cache miss (LIST + re-extract) without watch restart
+  // Also ensures correct fields are applied after watch connects (fixes GVK switch skeleton bug)
+  const prevWatchStatusRef = useRef<WatchStatus>('disconnected');
+  const prevSelectedFieldsKeyRef = useRef(selectedFieldsKey);
+  const prevDebouncedPreviewRef = useRef(debouncedPreview);
+  useEffect(() => {
+    // Detect watchStatus transition to 'connected' (from any other state)
+    const justConnected = prevWatchStatusRef.current !== 'connected' && watchStatus === 'connected';
+    prevWatchStatusRef.current = watchStatus;  // Always track status transitions
+
+    const fieldsChanged = prevSelectedFieldsKeyRef.current !== selectedFieldsKey;
+    const previewChanged = prevDebouncedPreviewRef.current !== debouncedPreview;
+
+    // Skip if nothing changed AND not just connected
+    // When justConnected: always call SetSelectedFields to guarantee backend has correct fields
+    // (StartWatch may have captured stale fields during GVK switch)
+    if (!justConnected && !fieldsChanged && !previewChanged) return;
+
+    // Don't send if not connected
+    if (watchStatus !== 'connected' || !gvk) return;
+
+    // Update field/preview refs when actually calling SetSelectedFields
+    prevSelectedFieldsKeyRef.current = selectedFieldsKey;
+    prevDebouncedPreviewRef.current = debouncedPreview;
+
+    // Build combined fields: selected + preview
+    const allFields = [...selectedFields];
+    if (debouncedPreview && !allFields.includes(debouncedPreview)) {
+      allFields.push(debouncedPreview);
+    }
+
+    console.log('useWindowedData: SetSelectedFields with', allFields.length, 'fields',
+      justConnected ? '(just connected)' : '(fields changed)');
+    SetSelectedFields(allFields)
+      .then((result) => {
+        if (result.extracting) {
+          // Async extraction in progress → clear stale data so new fields show skeleton
+          // instead of '-' (undefined). Re-fetch happens on fields:ready event.
+          setExtractingFields(true);
+          setVisibleRows(new Map());
+        } else {
+          // Cache hit → immediately re-fetch
+          setExtractingFields(false);
+          lastFetchRangeRef.current = { start: -1, end: -1 };
+          fetchRangeRef.current();
+        }
+      })
+      .catch((err) => {
+        console.error('useWindowedData: SetSelectedFields failed:', err);
+      });
+  }, [selectedFieldsKey, debouncedPreview, watchStatus, gvk, selectedFields]);
+
+  // Listen for fields:ready event (async extraction complete)
+  useEffect(() => {
+    const cleanup = EventsOn('fields:ready', () => {
+      console.log('useWindowedData: fields:ready received, re-fetching');
+      setExtractingFields(false);
+      lastFetchRangeRef.current = { start: -1, end: -1 };
+      fetchRangeRef.current();
+    });
+    return cleanup;
+  }, []);
+
   // Track previous search/filter state to detect changes
   const prevSearchFilterRef = useRef({ searchKey: '', filtersKey: '[]', sortKey: '' });
 
-  // Stable ref to fetchRange_ to avoid dependency issues
-  const fetchRangeRef = useRef(fetchRange_);
+  // Keep fetchRangeRef current
   fetchRangeRef.current = fetchRange_;
 
   // Re-fetch when sort/search/filters change
@@ -475,6 +570,7 @@ export function useWindowedData(
     error,
     watchStatus,
     initialSyncComplete,
+    extractingFields,
     getRowData,
     getRowId,
     onVisibleRangeChange,

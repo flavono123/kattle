@@ -96,6 +96,7 @@ export namespace main {
 	}
 	export class SetSelectedFieldsResult {
 	    needsResync: boolean;
+	    extracting: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new SetSelectedFieldsResult(source);
@@ -104,6 +105,7 @@ export namespace main {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.needsResync = source["needsResync"];
+	        this.extracting = source["extracting"];
 	    }
 	}
 	export class TreeNode {

@@ -287,6 +287,9 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
     };
   }, [sorting]);
 
+  // Convert previewField from string[] to dot notation for the hook
+  const previewFieldPath = previewField ? previewField.join('.') : undefined;
+
   // Use windowed data for large datasets (lazy loading)
   const windowedResult = useWindowedData(
     useWindowedMode ? selectedGVK : null,
@@ -296,11 +299,9 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
       sort: serverSort,
       overscan: 30,
       search: globalFilter,  // Server-side search
+      previewField: previewFieldPath,  // Hover preview field (debounced 200ms in hook)
     }
   );
-
-  // Convert previewField from string[] to dot notation for the hook
-  const previewFieldPath = previewField ? previewField.join('.') : undefined;
 
   // Use standard data fetching for small datasets
   const standardResult = useResourceData(
@@ -319,34 +320,37 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
   const loadingFields = useWindowedMode ? new Set<string>() : standardResult.loadingFields;  // Cell-level skeleton for loading fields
   const extractedFields = useWindowedMode ? new Set<string>() : standardResult.extractedFields;  // Fields extracted from backend
 
-  // For windowed mode, create virtual data array with actual data where loaded
-  // TanStack Table needs this for row model creation
+  // For windowed mode, data array contains ONLY loaded rows (~80) instead of totalCount placeholder objects.
+  // This reduces TanStack Table row model from 6616 to ~80 items (98.8% reduction).
+  // Skeleton rows are rendered directly in the virtualizer loop, bypassing TanStack.
   const data = useMemo(() => {
     if (!useWindowedMode) {
       return standardResult.data;
     }
-    // Create array of size totalCount with loaded data inserted at correct indices
-    // This is more memory efficient than creating placeholder objects for all rows
-    const result: Array<Record<string, unknown>> = [];
-    for (let i = 0; i < totalCount; i++) {
-      const rowData = windowedResult.getRowData(i);
-      if (rowData) {
-        result[i] = rowData;
-      } else {
-        // Placeholder for unloaded rows - minimal object with index
-        result[i] = { _placeholder: true, _index: i };
-      }
+    // Convert Map values to array (only loaded rows)
+    return Array.from(windowedResult.visibleRows.values());
+  }, [useWindowedMode, standardResult.data, windowedResult.visibleRows]);
+
+  // Maps virtual index → data array index for loaded rows.
+  // Unloaded virtual rows won't be in the map → render skeleton directly.
+  const virtualToRowIndex = useMemo(() => {
+    if (!useWindowedMode) return null;
+    const map = new Map<number, number>();
+    let dataIdx = 0;
+    for (const virtualIdx of windowedResult.visibleRows.keys()) {
+      map.set(virtualIdx, dataIdx);
+      dataIdx++;
     }
-    return result;
-  }, [useWindowedMode, totalCount, standardResult.data, windowedResult.visibleRows]);
+    return map;
+  }, [useWindowedMode, windowedResult.visibleRows]);
 
   // Row ID function
   const getRowId = useCallback((row: Record<string, unknown>, index: number) => {
     if (useWindowedMode) {
-      // For windowed mode, use _key if available, otherwise use index
+      // Windowed mode: data only contains loaded rows, use _key for stable identity
       const key = row._key as string | undefined;
       if (key) return key;
-      return `_placeholder_${index}`;
+      return `_row_${index}`;
     }
     return standardResult.getRowId(row);
   }, [useWindowedMode, standardResult.getRowId]);
@@ -582,7 +586,7 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
   // Create table instance
   // In windowed mode: disable client-side sorting/filtering (handled by server)
   const table = useReactTable({
-    data,
+    data,  // Windowed: ~80 loaded rows; Standard: all rows
     columns,
     getRowId,  // Stable row identity for real-time updates
     columnResizeMode: 'onChange',  // Enable column resizing
@@ -590,6 +594,8 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
     enableSortingRemoval: false,  // Toggle between asc/desc only (no "none" state)
     manualSorting: useWindowedMode,  // Server-side sorting in windowed mode
     manualFiltering: useWindowedMode,  // Server-side filtering in windowed mode
+    manualPagination: useWindowedMode,  // Server-side pagination in windowed mode
+    rowCount: useWindowedMode ? totalCount : undefined,  // Total rows for scrollbar sizing
     state: {
       globalFilter,  // Keep filter state for UI, server handles filtering in windowed mode
       sorting,
@@ -758,8 +764,8 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
         ref={toolbarRef}
         globalFilter={globalFilter}
         onGlobalFilterChange={setGlobalFilter}
-        filteredRowCount={rows.length}
-        totalRowCount={data.length}
+        filteredRowCount={useWindowedMode ? totalCount : rows.length}
+        totalRowCount={useWindowedMode ? totalCount : data.length}
         isLoading={loading || filterPending || (useWindowedMode && !initialSyncComplete)}
         headers={exportData.headers}
         rows={exportData.rows}
@@ -786,13 +792,13 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
               Loading {pluralize(selectedGVK?.kind?.toLowerCase() ?? 'resource')}...
             </p>
           </div>
-        ) : data.length === 0 && watchStatus === 'connected' && initialSyncComplete ? (
+        ) : (useWindowedMode ? totalCount : data.length) === 0 && watchStatus === 'connected' && initialSyncComplete ? (
           // Only show "No resources found" when fully connected AND initial sync is complete
           // This prevents brief flash during initial load and reconnection
           <div className="h-full flex items-center justify-center">
             <p className="text-sm text-muted-foreground">No resources found</p>
           </div>
-        ) : data.length === 0 ? (
+        ) : (useWindowedMode ? totalCount : data.length) === 0 ? (
           // Still connecting, reconnecting, or waiting for initial sync - show loading state
           <div className="h-full flex flex-col items-center justify-center gap-2">
             <Spinner className="w-8 h-8" />
@@ -800,7 +806,7 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
               Loading {pluralize(selectedGVK?.kind?.toLowerCase() ?? 'resource')}...
             </p>
           </div>
-        ) : rows.length === 0 ? (
+        ) : (useWindowedMode ? totalCount : rows.length) === 0 ? (
           <div className="h-full flex items-center justify-center">
             <p className="text-sm text-muted-foreground">
               No matches for "{globalFilter}"
@@ -894,39 +900,111 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
               }}
             >
               {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-                const row = rows[virtualRow.index];
                 const isRowFocused = focusedRowIndex === virtualRow.index;
 
-                // In windowed mode, check if this row is a placeholder (not yet loaded)
-                const isPlaceholder = useWindowedMode && (!row || row.original?._placeholder);
+                // Windowed mode: use virtualToRowIndex to find loaded row
+                if (useWindowedMode) {
+                  const dataIndex = virtualToRowIndex?.get(virtualRow.index);
 
-                // Render placeholder skeleton for unloaded rows
-                if (isPlaceholder) {
+                  // Unloaded row → render skeleton directly (bypasses TanStack Table)
+                  if (dataIndex == null) {
+                    return (
+                      <div
+                        key={`placeholder-${virtualRow.index}`}
+                        className="flex border-b border-border absolute top-0 left-0"
+                        style={{
+                          height: `${virtualRow.size}px`,
+                          transform: `translateY(${virtualRow.start}px)`,
+                          width: `max(${totalColumnsWidth}px, 100%)`,
+                        }}
+                      >
+                        {columns.map((col, colIndex) => (
+                          <div
+                            key={`skeleton-${virtualRow.index}-${colIndex}`}
+                            className="px-1 py-1 flex-shrink-0 flex items-center"
+                            style={{
+                              width: `${col.size || 100}px`,
+                              minWidth: `${col.minSize || 80}px`,
+                            }}
+                          >
+                            <div className="h-4 bg-muted/50 rounded animate-pulse w-3/4" />
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  }
+
+                  // Loaded row → render via TanStack row model
+                  const row = rows[dataIndex];
+                  if (!row) {
+                    // Edge case: data array updated but TanStack row model not yet refreshed
+                    return null;
+                  }
+
                   return (
                     <div
-                      key={`placeholder-${virtualRow.index}`}
-                      className="flex border-b border-border absolute top-0 left-0"
+                      key={row.id}
+                      className={cn(
+                        "flex border-b border-border hover:bg-focus transition-colors absolute top-0 left-0",
+                        isRowFocused && "bg-focus"
+                      )}
                       style={{
                         height: `${virtualRow.size}px`,
                         transform: `translateY(${virtualRow.start}px)`,
                         width: `max(${totalColumnsWidth}px, 100%)`,
                       }}
                     >
-                      {columns.map((col, colIndex) => (
-                        <div
-                          key={`skeleton-${virtualRow.index}-${colIndex}`}
-                          className="px-1 py-1 flex-shrink-0 flex items-center"
-                          style={{
-                            width: `${col.size || 100}px`,
-                            minWidth: `${col.minSize || 80}px`,
-                          }}
-                        >
-                          <div className="h-4 bg-muted/50 rounded animate-pulse w-3/4" />
-                        </div>
-                      ))}
+                      {row.getVisibleCells().map((cell, cellIndex) => {
+                        const isCellFocused = isRowFocused && focusedColIndex === cellIndex;
+                        const showCellPopover = popoverCell?.row === virtualRow.index && popoverCell?.col === cellIndex;
+                        const cellKey = `${row.id}-${cell.column.id}`;
+                        const showCopied = copiedCellKey === cellKey;
+                        const isPreviewCell = cell.column.id.startsWith('_preview.');
+                        const isColumnHighlighted = highlightedColumnPath && cell.column.id === highlightedColumnPath.join('.');
+                        const value = cell.getValue();
+                        const fullText = typeof value === 'object' && value !== null
+                          ? JSON.stringify(value)
+                          : String(value ?? '');
+                        const highlightIndices = getHighlightIndices(fullText);
+
+                        return (
+                          <div
+                            key={cell.id}
+                            className={cn(
+                              "px-1 py-1 text-sm flex-shrink-0",
+                              isPreviewCell && "opacity-50 border-l border-dashed border-border",
+                              isColumnHighlighted && "bg-focus"
+                            )}
+                            style={{
+                              width: `${cell.column.getSize()}px`,
+                              minWidth: `${cell.column.columnDef.minSize || 80}px`,
+                            }}
+                            onMouseEnter={() => {
+                              setFocusedRowIndex(virtualRow.index);
+                              setFocusedColIndex(cellIndex);
+                            }}
+                          >
+                            {windowedResult.extractingFields && value === undefined ? (
+                              <div className="h-4 bg-muted/50 rounded animate-pulse w-3/4" />
+                            ) : (
+                              <CellContent
+                                value={value}
+                                highlightIndices={highlightIndices}
+                                isFocused={isCellFocused}
+                                showPopover={showCellPopover}
+                                showCopied={showCopied}
+                              />
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                   );
                 }
+
+                // Non-windowed mode: standard rendering
+                const row = rows[virtualRow.index];
+                if (!row) return null;
 
                 return (
                   <div
@@ -943,42 +1021,29 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
                   >
                     {row.getVisibleCells().map((cell, cellIndex) => {
                       const isCellFocused = isRowFocused && focusedColIndex === cellIndex;
-                      // Debounced popover: only show after delay (popoverCell state)
                       const showCellPopover = popoverCell?.row === virtualRow.index && popoverCell?.col === cellIndex;
                       const cellKey = `${row.id}-${cell.column.id}`;
                       const showCopied = copiedCellKey === cellKey;
                       const isPreviewCell = cell.column.id.startsWith('_preview.');
                       const isColumnHighlighted = highlightedColumnPath && cell.column.id === highlightedColumnPath.join('.');
 
-                      // Get cell value first (needed for skeleton decision)
                       const value = cell.getValue();
 
-                      // Get the actual field path (strip _preview. prefix for preview columns)
                       const fieldPath = isPreviewCell
                         ? cell.column.id.replace('_preview.', '')
                         : cell.column.id;
 
-                      // Essential metadata fields (always extracted by backend, no skeleton needed)
-                      // These match essentialFieldPaths in app.go
                       const essentialFieldPrefixes = [
                         'metadata.name', 'metadata.namespace', 'metadata.uid',
                         'metadata.resourceVersion', 'metadata.creationTimestamp',
                         'metadata.labels', 'metadata.ownerReferences',
                         'metadata.deletionTimestamp', 'metadata.finalizers',
-                        '_context', // special field for multi-context
+                        '_context',
                       ];
                       const isEssentialField = essentialFieldPrefixes.some(
                         prefix => fieldPath === prefix || fieldPath.startsWith(prefix + '.')
                       );
-
-                      // Field is considered "extracted" if it's essential OR in extractedFields set
                       const isFieldExtracted = isEssentialField || extractedFields.has(fieldPath);
-
-                      // Show skeleton when:
-                      // 1. Field is in loadingFields (actively being fetched) AND value doesn't exist yet
-                      // 2. Field is not extracted yet AND value is undefined (not fetched from backend)
-                      // Note: null values are real data (field exists but has no value), not loading state
-                      // If value already exists (from previous selection), show it immediately instead of skeleton
                       const showSkeleton = (loadingFields.has(fieldPath) && value === undefined) ||
                         (!isFieldExtracted && value === undefined);
                       const fullText = typeof value === 'object' && value !== null
@@ -1000,13 +1065,11 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
                             minWidth: `${cell.column.columnDef.minSize || 80}px`,
                           }}
                           onMouseEnter={() => {
-                            // Mouse hover moves focus to this cell
                             setFocusedRowIndex(virtualRow.index);
                             setFocusedColIndex(cellIndex);
                           }}
                         >
                           {showSkeleton ? (
-                            // Skeleton for loading fields or preview cells without data
                             <div className="h-4 bg-muted/50 rounded animate-pulse w-3/4" />
                           ) : (
                             <CellContent

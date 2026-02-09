@@ -62,6 +62,9 @@ type SetSelectedFieldsResult struct {
 	// NeedsResync is true if the watch needs to be restarted to fetch newly selected fields.
 	// This happens in SQLStore mode when new fields are added that weren't extracted during initial sync.
 	NeedsResync bool `json:"needsResync"`
+	// Extracting is true when async field extraction is in progress (cache miss).
+	// Frontend should show skeleton until "fields:ready" event is received.
+	Extracting bool `json:"extracting"`
 }
 
 // watchController wraps a ResourceController with context info
@@ -493,10 +496,37 @@ func extractFieldsForSQL(obj *unstructured.Unstructured, selectedFields []string
 		extractPaths[p] = struct{}{}
 	}
 
+	// Track already-extracted wildcard parents to avoid duplicate extraction
+	extractedParents := make(map[string]struct{})
+
 	// Extract each field path
 	for path := range extractPaths {
-		if val, found, err := unstructured.NestedFieldCopy(obj.Object, splitPath(path)...); err == nil && found {
-			setNestedField(result, path, val)
+		parts := splitPath(path)
+
+		// Check for wildcard (*) in path
+		wildcardIdx := -1
+		for i, p := range parts {
+			if p == "*" {
+				wildcardIdx = i
+				break
+			}
+		}
+
+		if wildcardIdx > 0 {
+			// Extract parent path up to (but not including) the wildcard
+			parentPath := strings.Join(parts[:wildcardIdx], ".")
+			if _, done := extractedParents[parentPath]; done {
+				continue
+			}
+			extractedParents[parentPath] = struct{}{}
+			if val, found, err := unstructured.NestedFieldCopy(obj.Object, parts[:wildcardIdx]...); err == nil && found {
+				setNestedField(result, parentPath, val)
+			}
+		} else {
+			// Normal path without wildcard
+			if val, found, err := unstructured.NestedFieldCopy(obj.Object, parts...); err == nil && found {
+				setNestedField(result, path, val)
+			}
 		}
 	}
 
@@ -646,8 +676,15 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 				} else {
 					if useSQLStore && ss != nil {
 						// Store directly in SQLStore, skip FieldStore entirely
-						// Extract essential fields inline to avoid FieldStore overhead
-						fields := extractFieldsForSQL(obj, selectedFields)
+						// Read latest extractedFields under lock so fields added by
+						// concurrent SetSelectedFields calls are included.
+						a.watchMu.RLock()
+						currentFields := make([]string, 0, len(a.extractedFields))
+						for f := range a.extractedFields {
+							currentFields = append(currentFields, f)
+						}
+						a.watchMu.RUnlock()
+						fields := extractFieldsForSQL(obj, currentFields)
 						data, err := json.Marshal(fields)
 						if err != nil {
 							log.Printf("Warning: failed to marshal fields for %s: %v", key, err)
@@ -709,8 +746,16 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 						a.watchMu.RLock()
 						currentFs := a.fieldStore
 						currentSs := a.sqlStore
-						currentSelectedFields := []string{}
-						if currentFs != nil {
+						var currentSelectedFields []string
+						if useSQLStore && a.extractedFields != nil {
+							// Use ALL accumulated extracted fields so ongoing events
+							// don't overwrite SQLStore rows with fewer fields than
+							// what SetSelectedFields' LIST re-extraction produced.
+							currentSelectedFields = make([]string, 0, len(a.extractedFields))
+							for f := range a.extractedFields {
+								currentSelectedFields = append(currentSelectedFields, f)
+							}
+						} else if currentFs != nil {
 							currentSelectedFields = currentFs.GetSelectedFields()
 						}
 						a.watchMu.RUnlock()
@@ -880,30 +925,126 @@ func (a *App) StopWatch() {
 // SetSelectedFields updates the fields to extract for table display.
 // Called by frontend when user changes column selection.
 // Fields should be dot-notation paths like "status.phase", "spec.replicas".
-// Returns SetSelectedFieldsResult with NeedsResync=true if watch restart is required.
+//
+// In SQLStore mode, acts as a cache: if requested fields are already extracted,
+// returns immediately. On cache miss, performs a LIST from Kubernetes API,
+// re-extracts all fields (essential + all selected), and updates SQLStore.
+// This avoids full watch restart for new field selections.
 func (a *App) SetSelectedFields(fields []string) SetSelectedFieldsResult {
 	a.watchMu.Lock()
-	defer a.watchMu.Unlock()
 
 	fs := a.fieldStore
 	if fs != nil {
 		fs.SetSelectedFields(fields)
 	}
 
-	// In SQLStore mode, check if any new fields were added that weren't extracted
-	// If so, we need to resync because SQLStore only has the originally extracted fields
-	needsResync := false
-	if useSQLStore && a.extractedFields != nil {
-		for _, field := range fields {
-			if _, exists := a.extractedFields[field]; !exists {
-				log.Printf("[DEBUG] SetSelectedFields: field %q not in extractedFields, needs resync", field)
-				needsResync = true
-				break
-			}
+	// In non-SQLStore mode, no re-extraction needed
+	if !useSQLStore || a.extractedFields == nil {
+		a.watchMu.Unlock()
+		return SetSelectedFieldsResult{NeedsResync: false, Extracting: false}
+	}
+
+	// Find new fields not yet in extractedFields (cache miss)
+	var newFields []string
+	for _, field := range fields {
+		if _, exists := a.extractedFields[field]; !exists {
+			newFields = append(newFields, field)
 		}
 	}
 
-	return SetSelectedFieldsResult{NeedsResync: needsResync}
+	// Cache hit: all fields already extracted
+	if len(newFields) == 0 {
+		a.watchMu.Unlock()
+		return SetSelectedFieldsResult{NeedsResync: false, Extracting: false}
+	}
+
+	// Update extractedFields with new fields
+	for _, f := range newFields {
+		a.extractedFields[f] = struct{}{}
+	}
+
+	// Build allSelectedFields from extractedFields (minus essentials, since extractFieldsForSQL adds them)
+	essentialSet := make(map[string]struct{}, len(essentialFieldPaths))
+	for _, p := range essentialFieldPaths {
+		essentialSet[p] = struct{}{}
+	}
+	var allSelectedFields []string
+	for f := range a.extractedFields {
+		if _, isEssential := essentialSet[f]; !isEssential {
+			allSelectedFields = append(allSelectedFields, f)
+		}
+	}
+
+	// Capture references before unlocking
+	controllers := make([]*watchController, len(a.controllers))
+	copy(controllers, a.controllers)
+	ss := a.sqlStore
+
+	// Unlock BEFORE LIST calls to avoid blocking the event handler goroutines
+	a.watchMu.Unlock()
+
+	if ss == nil {
+		return SetSelectedFieldsResult{NeedsResync: false, Extracting: false}
+	}
+
+	log.Printf("[DEBUG] SetSelectedFields: cache miss for %d new fields (async): %v", len(newFields), newFields)
+
+	// Async extraction: goroutine waits for controllers (if sync in progress),
+	// then LIST + re-extract, emits "fields:ready" when done.
+	go func() {
+		ctrls := controllers
+
+		// If no controllers yet (sync in progress), wait until at least one is registered.
+		if len(ctrls) == 0 {
+			log.Printf("[DEBUG] SetSelectedFields goroutine: waiting for controllers...")
+			for i := 0; i < 600; i++ { // 30s max (600 * 50ms)
+				time.Sleep(50 * time.Millisecond)
+				a.watchMu.RLock()
+				ctrls = make([]*watchController, len(a.controllers))
+				copy(ctrls, a.controllers)
+				a.watchMu.RUnlock()
+				if len(ctrls) > 0 {
+					break
+				}
+			}
+			if len(ctrls) == 0 {
+				log.Printf("Warning: SetSelectedFields goroutine timed out waiting for controllers")
+				runtime.EventsEmit(a.ctx, "fields:ready")
+				return
+			}
+			log.Printf("[DEBUG] SetSelectedFields goroutine: got %d controllers", len(ctrls))
+		}
+
+		for _, wc := range ctrls {
+			list, err := wc.controller.ListAll()
+			if err != nil {
+				log.Printf("Warning: ListAll failed for context %s: %v", wc.contextName, err)
+				continue
+			}
+
+			for i := range list.Items {
+				obj := &list.Items[i]
+				key := makeResourceKey(wc.contextName, obj.GetNamespace(), obj.GetName())
+				extracted := extractFieldsForSQL(obj, allSelectedFields)
+				data, err := json.Marshal(extracted)
+				if err != nil {
+					log.Printf("Warning: failed to marshal fields for %s: %v", key, err)
+					continue
+				}
+				if err := ss.Upsert(key, wc.contextName, obj.GetNamespace(), obj.GetName(), data); err != nil {
+					log.Printf("Warning: SQLStore upsert failed for %s: %v", key, err)
+				}
+			}
+
+			log.Printf("[DEBUG] SetSelectedFields: re-extracted %d resources for context %s (async)", len(list.Items), wc.contextName)
+		}
+
+		// Notify frontend that extraction is complete
+		runtime.EventsEmit(a.ctx, "fields:ready")
+	}()
+
+	// Return immediately with Extracting=true (frontend shows skeleton)
+	return SetSelectedFieldsResult{NeedsResync: false, Extracting: true}
 }
 
 // GetResourcesByKeys fetches resources by keys (Pull Model)
