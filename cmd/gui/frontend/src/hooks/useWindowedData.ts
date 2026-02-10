@@ -10,7 +10,7 @@ import {
   GetResourcesRangeFiltered,
 } from '../../wailsjs/go/main/App';
 import type { main } from '../../wailsjs/go/models';
-import { getResourceKey } from '../lib/resource-utils';
+import { getResourceKey, diffFields, type CellChange } from '../lib/resource-utils';
 
 export type WatchStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
@@ -81,6 +81,8 @@ export interface UseWindowedDataResult {
   fetchRange: { start: number; end: number };
   /** Whether async field extraction is in progress (cache miss) */
   extractingFields: boolean;
+  /** Cells that changed in the most recent fetch (for flash animation) */
+  changedCells: CellChange[];
   /** Manual refresh */
   refresh: () => void;
 }
@@ -137,6 +139,7 @@ export function useWindowedData(
   const [watchStatus, setWatchStatus] = useState<WatchStatus>('disconnected');
   const [initialSyncComplete, setInitialSyncComplete] = useState(false);
   const [extractingFields, setExtractingFields] = useState(false);
+  const [changedCells, setChangedCells] = useState<CellChange[]>([]);
 
   // Debounced preview field (200ms delay for hover)
   const [debouncedPreview, setDebouncedPreview] = useState<string | undefined>();
@@ -225,6 +228,8 @@ export function useWindowedData(
       const fetchedRows = rows ?? [];
       setVisibleRows(prev => {
         const newMap = new Map(prev);
+        const changes: CellChange[] = [];
+        const now = Date.now();
 
         // Clear rows outside the new range (with some buffer)
         const clearStart = range.start - overscan * 2;
@@ -235,10 +240,30 @@ export function useWindowedData(
           }
         }
 
-        // Add new rows
+        // Add new rows and detect cell-level changes
         fetchedRows.forEach((row, i) => {
-          newMap.set(range.start + i, row);
+          const idx = range.start + i;
+          const oldRow = prev.get(idx);
+
+          if (oldRow) {
+            // Compare same-position rows by key to detect actual changes
+            const oldKey = getResourceKey(oldRow);
+            const newKey = getResourceKey(row);
+            if (oldKey === newKey) {
+              const changedPaths = diffFields(oldRow, row);
+              for (const columnId of changedPaths) {
+                changes.push({ rowId: newKey, columnId, timestamp: now });
+              }
+            }
+          }
+
+          newMap.set(idx, row);
         });
+
+        // Update changedCells for flash animation
+        if (changes.length > 0) {
+          setChangedCells(changes);
+        }
 
         return newMap;
       });
@@ -571,6 +596,7 @@ export function useWindowedData(
     watchStatus,
     initialSyncComplete,
     extractingFields,
+    changedCells,
     getRowData,
     getRowId,
     onVisibleRangeChange,

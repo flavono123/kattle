@@ -154,36 +154,15 @@ export function useResourceData(
     prevGvkRef.current = gvk;
     prevContextsKeyRef.current = currentContextsKey;
 
-    // Check if this is a field-change restart (skip full loading, use cell skeleton instead)
-    const isFieldChangeRestart = isFieldChangeRestartRef.current;
-    isFieldChangeRestartRef.current = false; // Reset flag
-
-    // Check if only preview field changed and needs fetch
-    // Use ref to avoid stale closure issues with extractedFields state
-    const isPreviewFieldChange = !shouldClearData &&
-      !isFieldChangeRestart &&
-      debouncedPreviewField &&
-      !extractedFieldsRef.current.has(debouncedPreviewField);
-
-    // Skip restart if nothing actually changed that requires it
-    // Only skip if watch is already connected with the right fields
-    if (!shouldClearData && !isFieldChangeRestart && !isPreviewFieldChange && watchStatus === 'connected') {
-      console.log('useResourceData: skipping unnecessary restart');
-      return;
-    }
+    // Reset field-change restart flag (consumed by this run)
+    isFieldChangeRestartRef.current = false;
 
     const watchGen = ++watchGenRef.current;
     setError(null);
 
-    // Add preview field to loadingFields for skeleton UI
-    if (isPreviewFieldChange) {
-      console.log('useResourceData: preview field change, showing skeleton:', debouncedPreviewField);
-      setLoadingFields(prev => new Set([...prev, debouncedPreviewField]));
-    }
-
-    // Show loading only if NOT a field-change restart and NOT a preview-field-only change
-    // Field-change and preview-field restarts use cell-level skeleton UI instead of full loading spinner
-    if (!isFieldChangeRestart && !isPreviewFieldChange) {
+    // Show loading only for full restarts (GVK/context change).
+    // Field-change restarts use cell-level skeleton UI instead of full loading spinner.
+    if (shouldClearData) {
       setLoading(true);
     }
 
@@ -209,10 +188,8 @@ export function useResourceData(
     hasReceivedFirstBatch.current = false;
     hasReceivedAnyEvent.current = false;
 
-    // Combine selectedFields with debouncedPreviewField for extraction
-    const allFieldsToExtract = debouncedPreviewField
-      ? [...selectedFields, debouncedPreviewField]
-      : selectedFields;
+    // Fields to extract (preview field is handled by a separate effect)
+    const allFieldsToExtract = selectedFields;
 
     // Chain the start operation to ensure previous stop completes first
     const startOperation = watchOperationRef.current
@@ -337,9 +314,9 @@ export function useResourceData(
     };
     // NOTE: fieldChangeRestartKey is included to re-run this effect when
     // the selectedFields effect determines a resync is needed (SQLStore mode).
-    // debouncedPreviewField is included to restart watch when hover preview field changes.
-    // This ensures proper event subscription setup after watch restart.
-  }, [watch, gvk, contexts, fieldChangeRestartKey, debouncedPreviewField]);
+    // debouncedPreviewField is NOT a dependency - preview field changes are handled
+    // by a separate effect to avoid losing event subscriptions on early return.
+  }, [watch, gvk, contexts, fieldChangeRestartKey]);
 
   // Cleanup on unmount - ensure watch is stopped
   useEffect(() => {
@@ -427,6 +404,62 @@ export function useResourceData(
         console.error('useResourceData: failed to update selectedFields:', err);
       });
   }, [watch, gvk, contexts, watchStatus, selectedFieldsKey, selectedFields]);
+
+  // Handle debouncedPreviewField changes without restarting watch.
+  // This is separate from the main watch effect to avoid losing event subscriptions.
+  useEffect(() => {
+    if (!watch || !gvk || watchStatus !== 'connected') return;
+    if (!debouncedPreviewField) return;
+    if (extractedFieldsRef.current.has(debouncedPreviewField)) return;
+
+    console.log('useResourceData: preview field change, showing skeleton:', debouncedPreviewField);
+    setLoadingFields(prev => new Set([...prev, debouncedPreviewField]));
+
+    // Build combined fields: selected + preview
+    const allFields = [...selectedFields];
+    if (!allFields.includes(debouncedPreviewField)) {
+      allFields.push(debouncedPreviewField);
+    }
+
+    SetSelectedFields(allFields)
+      .then(async (result) => {
+        // Track the preview field as extracted
+        extractedFieldsRef.current.add(debouncedPreviewField);
+        setExtractedFields(new Set(extractedFieldsRef.current));
+
+        if (result && result.needsResync) {
+          console.log('useResourceData: preview field requires resync');
+          isFieldChangeRestartRef.current = true;
+          setFieldChangeRestartKey(prev => prev + 1);
+        } else {
+          // Queue keys for re-fetch to get preview field values
+          try {
+            const allKeys = await GetAllResourceKeys();
+            if (allKeys && allKeys.length > 0) {
+              for (const key of allKeys) {
+                pendingKeys.current.add(key);
+              }
+            }
+          } catch (err) {
+            console.error('useResourceData: preview field re-fetch failed:', err);
+          }
+        }
+
+        setLoadingFields(prev => {
+          const next = new Set(prev);
+          next.delete(debouncedPreviewField);
+          return next;
+        });
+      })
+      .catch((err) => {
+        console.error('useResourceData: preview SetSelectedFields failed:', err);
+        setLoadingFields(prev => {
+          const next = new Set(prev);
+          next.delete(debouncedPreviewField);
+          return next;
+        });
+      });
+  }, [watch, gvk, watchStatus, debouncedPreviewField, selectedFields]);
 
   // Batch processor: apply delta updates and fetch remaining resources
   // Delta updates (with fields in event) are applied directly without GetResourcesByKeys
@@ -556,7 +589,7 @@ export function useResourceData(
     // IMPORTANT: Dependencies must match the main watch effect to keep watchGen in sync.
     // If the main effect re-runs and increments watchGen, this effect must also re-run
     // to capture the new watchGen, otherwise flush will skip due to mismatch.
-  }, [watch, batchInterval, gvk, contexts, fieldChangeRestartKey, debouncedPreviewField]);
+  }, [watch, batchInterval, gvk, contexts, fieldChangeRestartKey]);
 
   // Manual refresh - restarts the watch
   const refresh = useCallback(() => {

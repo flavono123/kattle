@@ -316,7 +316,7 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
   const watchStatus = useWindowedMode ? windowedResult.watchStatus : standardResult.watchStatus;
   const initialSyncComplete = useWindowedMode ? windowedResult.initialSyncComplete : true;  // Standard mode always synced
   const totalCount = useWindowedMode ? windowedResult.totalCount : standardResult.data.length;
-  const changedCells = useWindowedMode ? [] : standardResult.changedCells;  // No cell flashing in windowed mode
+  const changedCells = useWindowedMode ? windowedResult.changedCells : standardResult.changedCells;
   const loadingFields = useWindowedMode ? new Set<string>() : standardResult.loadingFields;  // Cell-level skeleton for loading fields
   const extractedFields = useWindowedMode ? new Set<string>() : standardResult.extractedFields;  // Fields extracted from backend
 
@@ -972,6 +972,7 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
                             key={cell.id}
                             className={cn(
                               "px-1 py-1 text-sm flex-shrink-0",
+                              isFlashing(row.id, cell.column.id) && "animate-cell-flash",
                               isPreviewCell && "opacity-50 border-l border-dashed border-border",
                               isColumnHighlighted && "bg-focus"
                             )}
