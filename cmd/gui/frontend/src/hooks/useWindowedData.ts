@@ -158,6 +158,7 @@ export function useWindowedData(
   const pendingFetchRef = useRef(false);
   const lastFetchRangeRef = useRef({ start: -1, end: -1 });
   const fetchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const countVerifyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Stable ref to fetchRange_ — updated each render, used in effects to avoid stale closures
   const fetchRangeRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
@@ -354,18 +355,18 @@ export function useWindowedData(
       }
     });
 
-    // Subscribe to resource:update for real-time updates
-    const unsubscribeResourceUpdate = EventsOn('resource:update', async (event: { type: string; key: string }) => {
-      if (watchGen !== watchGenRef.current) return;
-
-      // Refresh count on add/delete
-      if (event.type === 'ADDED' || event.type === 'DELETED') {
+    // Debounced count verification: batches rapid ADDED/DELETED events into a single server round-trip.
+    // Optimistic count is applied immediately; this verifies against the server after events settle.
+    const scheduleCountVerification = () => {
+      if (countVerifyTimeoutRef.current) {
+        clearTimeout(countVerifyTimeoutRef.current);
+      }
+      countVerifyTimeoutRef.current = setTimeout(async () => {
+        if (watchGen !== watchGenRef.current) return;
         try {
-          // Use paramsRef to get current search/filter values (avoids stale closure)
           const currentParams = paramsRef.current;
           let count: number;
           if (currentParams.debouncedSearch || currentParams.filters.length > 0) {
-            // Use filtered count when filters are active
             const queryParams: QueryParams = {
               start: 0,
               end: 0,
@@ -382,9 +383,54 @@ export function useWindowedData(
           totalCountRef.current = count;
           setTotalCount(count);
         } catch (err) {
-          console.error('useWindowedData: failed to get count:', err);
+          console.error('useWindowedData: count verification failed:', err);
         }
+      }, 300);
+    };
+
+    // Subscribe to resource:update for real-time updates (Phase 3: optimistic updates)
+    const unsubscribeResourceUpdate = EventsOn('resource:update', (event: { type: string; key: string }) => {
+      if (watchGen !== watchGenRef.current) return;
+
+      if (event.type === 'DELETED') {
+        // Optimistic delete: remove row from visibleRows immediately
+        setVisibleRows(prev => {
+          let found = false;
+          for (const [, row] of prev) {
+            if ((row as Record<string, unknown>)._key === event.key) {
+              found = true;
+              break;
+            }
+          }
+          if (!found) return prev;
+
+          const newMap = new Map<number, Record<string, unknown>>();
+          for (const [idx, row] of prev) {
+            if ((row as Record<string, unknown>)._key !== event.key) {
+              newMap.set(idx, row);
+            }
+          }
+          return newMap;
+        });
+
+        // Optimistic count: decrement immediately
+        totalCountRef.current = Math.max(0, totalCountRef.current - 1);
+        setTotalCount(totalCountRef.current);
+
+        // Verify count with server (debounced)
+        scheduleCountVerification();
+      } else if (event.type === 'ADDED') {
+        // Optimistic count: increment immediately (only when no filters active,
+        // since we can't know if the new resource matches the current filter)
+        if (!paramsRef.current.hasFilters) {
+          totalCountRef.current += 1;
+          setTotalCount(totalCountRef.current);
+        }
+
+        // Always verify count with server (especially needed when filters active)
+        scheduleCountVerification();
       }
+      // MODIFIED: no count change, just re-fetch data below
 
       // Re-fetch visible range (data might have changed)
       // Reset last fetch range to force re-fetch
@@ -403,6 +449,9 @@ export function useWindowedData(
       unsubscribeResourceUpdate();
       if (fetchTimeoutRef.current) {
         clearTimeout(fetchTimeoutRef.current);
+      }
+      if (countVerifyTimeoutRef.current) {
+        clearTimeout(countVerifyTimeoutRef.current);
       }
       setWatchStatus('disconnected');
     };
