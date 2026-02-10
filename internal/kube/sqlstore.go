@@ -53,6 +53,9 @@ type SQLStore struct {
 	stmtUpsert *sql.Stmt
 	stmtDelete *sql.Stmt
 	stmtGet    *sql.Stmt
+
+	// FTS5 availability (false if SQLite build doesn't support it)
+	hasFTS bool
 }
 
 // NewSQLStore creates a new SQLStore instance.
@@ -95,10 +98,21 @@ func NewSQLStore(dbPath string) (*SQLStore, error) {
 	);
 	CREATE INDEX IF NOT EXISTS idx_context ON resources(context);
 	CREATE INDEX IF NOT EXISTS idx_namespace ON resources(namespace);
+	CREATE INDEX IF NOT EXISTS idx_name ON resources(name);
+	CREATE INDEX IF NOT EXISTS idx_context_namespace_name ON resources(context, namespace, name);
 	`
 	if _, err := db.Exec(createTableSQL); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create resources table: %w", err)
+	}
+
+	// FTS5 for text search (optional - gracefully degrades if unavailable)
+	hasFTS := false
+	ftsSQL := `CREATE VIRTUAL TABLE IF NOT EXISTS resources_fts USING fts5(name, namespace, content='', contentless_delete=1)`
+	if _, err := db.Exec(ftsSQL); err != nil {
+		log.Printf("SQLStore: FTS5 not available, falling back to LIKE search: %v", err)
+	} else {
+		hasFTS = true
 	}
 
 	// Prepare statements
@@ -132,6 +146,7 @@ func NewSQLStore(dbPath string) (*SQLStore, error) {
 		stmtUpsert: stmtUpsert,
 		stmtDelete: stmtDelete,
 		stmtGet:    stmtGet,
+		hasFTS:     hasFTS,
 	}, nil
 }
 
@@ -146,6 +161,15 @@ func (s *SQLStore) Upsert(key, context, namespace, name string, data []byte) err
 	if err != nil {
 		return fmt.Errorf("failed to upsert resource %s: %w", key, err)
 	}
+
+	// Sync FTS index (contentless: manual insert with rowid from main table)
+	if s.hasFTS {
+		var rowid int64
+		if err := s.db.QueryRow("SELECT rowid FROM resources WHERE key = ?", key).Scan(&rowid); err == nil {
+			s.db.Exec("INSERT OR REPLACE INTO resources_fts(rowid, name, namespace) VALUES (?, ?, ?)", rowid, name, namespace)
+		}
+	}
+
 	return nil
 }
 
@@ -154,10 +178,25 @@ func (s *SQLStore) Delete(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Get rowid before delete for FTS cleanup
+	var rowid int64
+	hasFTSRow := false
+	if s.hasFTS {
+		if err := s.db.QueryRow("SELECT rowid FROM resources WHERE key = ?", key).Scan(&rowid); err == nil {
+			hasFTSRow = true
+		}
+	}
+
 	_, err := s.stmtDelete.Exec(key)
 	if err != nil {
 		return fmt.Errorf("failed to delete resource %s: %w", key, err)
 	}
+
+	// Remove from FTS index
+	if s.hasFTS && hasFTSRow {
+		s.db.Exec("INSERT INTO resources_fts(resources_fts, rowid, name, namespace) VALUES('delete', ?, '', '')", rowid)
+	}
+
 	return nil
 }
 
@@ -305,6 +344,13 @@ func (s *SQLStore) Clear() error {
 	if err != nil {
 		return fmt.Errorf("failed to clear resources: %w", err)
 	}
+
+	// Rebuild FTS index (drop and recreate is faster than row-by-row delete)
+	if s.hasFTS {
+		s.db.Exec("DROP TABLE IF EXISTS resources_fts")
+		s.db.Exec("CREATE VIRTUAL TABLE IF NOT EXISTS resources_fts USING fts5(name, namespace, content='', contentless_delete=1)")
+	}
+
 	return nil
 }
 
@@ -454,20 +500,28 @@ func (s *SQLStore) GetRange(start, end int, sortField string, sortDesc bool) ([]
 }
 
 // buildWhereClause builds WHERE clause from QueryParams.
-// Returns the WHERE SQL string (including "WHERE" keyword if needed) and arguments.
-func buildWhereClause(params QueryParams) (string, []any) {
+// When useFTS is true and search term is present, uses FTS5 MATCH via rowid subquery
+// for faster text search. Falls back to LIKE when FTS5 is not available.
+func buildWhereClause(params QueryParams, useFTS bool) (string, []any) {
 	var whereClauses []string
 	var args []any
 
-	// Global search (name, namespace, status.phase)
+	// Global search
 	if params.Search != "" {
-		searchPattern := "%" + escapeLike(params.Search) + "%"
-		whereClauses = append(whereClauses, `(
-			name LIKE ? ESCAPE '\' OR
-			namespace LIKE ? ESCAPE '\' OR
-			json_extract(data, '$.status.phase') LIKE ? ESCAPE '\'
-		)`)
-		args = append(args, searchPattern, searchPattern, searchPattern)
+		if useFTS {
+			// FTS5 MATCH via rowid subquery (much faster than LIKE for large datasets)
+			whereClauses = append(whereClauses, `rowid IN (SELECT rowid FROM resources_fts WHERE resources_fts MATCH ?)`)
+			args = append(args, params.Search)
+		} else {
+			// Fallback: LIKE search on name, namespace, status.phase
+			searchPattern := "%" + escapeLike(params.Search) + "%"
+			whereClauses = append(whereClauses, `(
+				name LIKE ? ESCAPE '\' OR
+				namespace LIKE ? ESCAPE '\' OR
+				json_extract(data, '$.status.phase') LIKE ? ESCAPE '\'
+			)`)
+			args = append(args, searchPattern, searchPattern, searchPattern)
+		}
 	}
 
 	// Individual filters (AND combination)
@@ -511,7 +565,7 @@ func (s *SQLStore) GetRangeWithFilters(params QueryParams) ([]map[string]any, er
 		return nil, nil
 	}
 
-	whereSQL, whereArgs := buildWhereClause(params)
+	whereSQL, whereArgs := buildWhereClause(params, s.hasFTS)
 	orderBy := buildOrderByClause(params.SortField, params.SortDesc)
 
 	query := fmt.Sprintf(`
@@ -526,7 +580,18 @@ func (s *SQLStore) GetRangeWithFilters(params QueryParams) ([]map[string]any, er
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query range with filters: %w", err)
+		if s.hasFTS && params.Search != "" {
+			// FTS5 MATCH failed (e.g., syntax error in search term) - retry with LIKE
+			whereSQL, whereArgs = buildWhereClause(params, false)
+			query = fmt.Sprintf("SELECT key, context, data FROM resources %s ORDER BY %s LIMIT ? OFFSET ?", whereSQL, orderBy)
+			args = append(whereArgs, limit, params.Start)
+			rows, err = s.db.Query(query, args...)
+			if err != nil {
+				return nil, fmt.Errorf("failed to query range with filters: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to query range with filters: %w", err)
+		}
 	}
 	defer rows.Close()
 
@@ -563,14 +628,24 @@ func (s *SQLStore) CountWithFilters(params QueryParams) (int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	whereSQL, whereArgs := buildWhereClause(params)
+	whereSQL, whereArgs := buildWhereClause(params, s.hasFTS)
 
 	query := fmt.Sprintf("SELECT COUNT(*) FROM resources %s", whereSQL)
 
 	var count int
 	err := s.db.QueryRow(query, whereArgs...).Scan(&count)
 	if err != nil {
-		return 0, fmt.Errorf("failed to count with filters: %w", err)
+		if s.hasFTS && params.Search != "" {
+			// FTS5 MATCH failed - retry with LIKE
+			whereSQL, whereArgs = buildWhereClause(params, false)
+			query = fmt.Sprintf("SELECT COUNT(*) FROM resources %s", whereSQL)
+			err = s.db.QueryRow(query, whereArgs...).Scan(&count)
+			if err != nil {
+				return 0, fmt.Errorf("failed to count with filters: %w", err)
+			}
+		} else {
+			return 0, fmt.Errorf("failed to count with filters: %w", err)
+		}
 	}
 
 	return count, nil
