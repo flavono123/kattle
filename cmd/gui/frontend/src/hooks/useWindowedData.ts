@@ -452,10 +452,10 @@ export function useWindowedData(
     SetSelectedFields(allFields)
       .then((result) => {
         if (result.extracting) {
-          // Async extraction in progress → clear stale data so new fields show skeleton
-          // instead of '-' (undefined). Re-fetch happens on fields:ready event.
+          // Async extraction in progress - keep existing data visible.
+          // New/changed fields show skeleton via extractingFields && value === undefined.
+          // Re-fetch with all fields happens on fields:ready event.
           setExtractingFields(true);
-          setVisibleRows(new Map());
         } else {
           // Cache hit → immediately re-fetch
           setExtractingFields(false);

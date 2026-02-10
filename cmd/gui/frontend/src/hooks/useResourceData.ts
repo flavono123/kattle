@@ -65,6 +65,10 @@ export function useResourceData(
 
   // Debounced preview field - stabilizes after 250ms of no changes
   const [debouncedPreviewField, setDebouncedPreviewField] = useState<string | undefined>(undefined);
+  // Ref for main watch effect to include preview field without adding it as a dependency.
+  // Prevents restart loop: preview effect → restart → extractedFieldsRef cleared → preview re-fires.
+  const debouncedPreviewFieldRef = useRef<string | undefined>(undefined);
+  debouncedPreviewFieldRef.current = debouncedPreviewField;
 
   // Debounce previewField changes (200ms for hover to feel responsive)
   useEffect(() => {
@@ -188,8 +192,13 @@ export function useResourceData(
     hasReceivedFirstBatch.current = false;
     hasReceivedAnyEvent.current = false;
 
-    // Fields to extract (preview field is handled by a separate effect)
-    const allFieldsToExtract = selectedFields;
+    // Fields to extract - include current preview field to prevent restart loop.
+    // Without this, preview effect triggers restart → extractedFieldsRef cleared →
+    // preview effect re-fires → infinite restart loop.
+    const currentPreview = debouncedPreviewFieldRef.current;
+    const allFieldsToExtract = currentPreview && !selectedFields.includes(currentPreview)
+      ? [...selectedFields, currentPreview]
+      : selectedFields;
 
     // Chain the start operation to ensure previous stop completes first
     const startOperation = watchOperationRef.current
