@@ -166,7 +166,9 @@ func (s *SQLStore) Upsert(key, context, namespace, name string, data []byte) err
 	if s.hasFTS {
 		var rowid int64
 		if err := s.db.QueryRow("SELECT rowid FROM resources WHERE key = ?", key).Scan(&rowid); err == nil {
-			s.db.Exec("INSERT OR REPLACE INTO resources_fts(rowid, name, namespace) VALUES (?, ?, ?)", rowid, name, namespace)
+			if _, err := s.db.Exec("INSERT OR REPLACE INTO resources_fts(rowid, name, namespace) VALUES (?, ?, ?)", rowid, name, namespace); err != nil {
+				log.Printf("Warning: FTS upsert failed for %s: %v", key, err)
+			}
 		}
 	}
 
@@ -194,7 +196,9 @@ func (s *SQLStore) Delete(key string) error {
 
 	// Remove from FTS index
 	if s.hasFTS && hasFTSRow {
-		s.db.Exec("INSERT INTO resources_fts(resources_fts, rowid, name, namespace) VALUES('delete', ?, '', '')", rowid)
+		if _, err := s.db.Exec("INSERT INTO resources_fts(resources_fts, rowid, name, namespace) VALUES('delete', ?, '', '')", rowid); err != nil {
+			log.Printf("Warning: FTS delete failed for %s: %v", key, err)
+		}
 	}
 
 	return nil
@@ -347,8 +351,12 @@ func (s *SQLStore) Clear() error {
 
 	// Rebuild FTS index (drop and recreate is faster than row-by-row delete)
 	if s.hasFTS {
-		s.db.Exec("DROP TABLE IF EXISTS resources_fts")
-		s.db.Exec("CREATE VIRTUAL TABLE IF NOT EXISTS resources_fts USING fts5(name, namespace, content='', contentless_delete=1)")
+		if _, err := s.db.Exec("DROP TABLE IF EXISTS resources_fts"); err != nil {
+			log.Printf("Warning: FTS drop failed: %v", err)
+		}
+		if _, err := s.db.Exec("CREATE VIRTUAL TABLE IF NOT EXISTS resources_fts USING fts5(name, namespace, content='', contentless_delete=1)"); err != nil {
+			log.Printf("Warning: FTS recreate failed: %v", err)
+		}
 	}
 
 	return nil
