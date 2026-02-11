@@ -423,36 +423,6 @@ func (a *App) GetDefaultSelectedPaths(gvk MultiClusterGVK, contexts []string) []
 	return nil
 }
 
-// GetResources returns resources from FieldStore (reconstructed objects)
-// Deprecated: Frontend should use GetResourcesByKeys instead for Pull Model
-// This is kept for backward compatibility only
-func (a *App) GetResources(gvk MultiClusterGVK, contexts []string) ([]map[string]any, error) {
-	// Use FieldStore to get resource data (memory-efficient)
-	a.watchMu.RLock()
-	fs := a.fieldStore
-	a.watchMu.RUnlock()
-
-	if fs == nil {
-		return nil, nil // No active watch, return empty
-	}
-
-	keys := fs.List()
-	result := make([]map[string]any, 0, len(keys))
-
-	for _, key := range keys {
-		if obj := fs.ReconstructObject(key); obj != nil {
-			// Extract context from key (format: "context/namespace/name")
-			parts := strings.SplitN(key, "/", 2)
-			if len(parts) > 0 {
-				obj["_context"] = parts[0]
-			}
-			result = append(result, obj)
-		}
-	}
-
-	return result, nil
-}
-
 // ResourceEventMeta represents a watch event with optional delta data.
 // - When KATTLE_USE_SQLSTORE=0 (default): includes Fields for direct frontend update (delta model)
 // - When KATTLE_USE_SQLSTORE=1: Fields is omitted, frontend uses Pull Model via GetResourcesByKeys

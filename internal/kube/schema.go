@@ -16,11 +16,6 @@ import (
 	"k8s.io/kube-openapi/pkg/validation/spec"
 )
 
-// GetDocument retrieves the OpenAPI document for a GVR from the current context (legacy, kept for TUI compatibility)
-func GetDocument(gvr schema.GroupVersionResource) (*spec3.OpenAPI, error) {
-	return getDocumentForContext("", gvr)
-}
-
 // getDocumentForContext retrieves the OpenAPI document for a GVR from the specified context
 // If contextName is empty, uses the current context
 func getDocumentForContext(contextName string, gvr schema.GroupVersionResource) (*spec3.OpenAPI, error) {
@@ -307,23 +302,6 @@ func extractEnum(schema *spec.Schema) []string {
 func getDocumentPath(gvr schema.GroupVersionResource) string {
 	return strings.TrimPrefix(strings.Join([]string{getPathPrefix(gvr), gvr.Version}, "/"), "/")
 }
-
-// TODO: remove if not used
-// func GetClusterScopedPath(gvr schema.GroupVersionResource) string {
-// 	return strings.Join([]string{GetPathPrefix(gvr), gvr.Version, gvr.Resource}, "/")
-// }
-
-// func GetClusterScopedNamePath(gvr schema.GroupVersionResource) string {
-// 	return strings.Join([]string{GetPathPrefix(gvr), gvr.Version, gvr.Resource, "{name}"}, "/")
-// }
-
-// func GetNamespaceScopedPath(gvr schema.GroupVersionResource) string {
-// 	return strings.Join([]string{GetPathPrefix(gvr), gvr.Version, "namespaces", "{namespace}", gvr.Resource}, "/")
-// }
-
-// func GetNamespaceScopedNamePath(gvr schema.GroupVersionResource) string {
-// 	return strings.Join([]string{GetPathPrefix(gvr), gvr.Version, "namespaces", "{namespace}", gvr.Resource, "{name}"}, "/")
-// }
 
 // GetPrinterColumnsForContext retrieves printer columns for a GVK.
 // For CRDs: extracts additionalPrinterColumns from CRD definition (has JSONPath).
