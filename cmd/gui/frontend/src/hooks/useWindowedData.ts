@@ -272,7 +272,10 @@ export function useWindowedData(
       // Always mark loading as complete after successful fetch
       setLoading(false);
     } catch (err) {
+      if (currentWatchGen !== watchGenRef.current) return;
       console.error('useWindowedData: failed to fetch range:', err);
+      setError(err instanceof Error ? err : new Error(String(err)));
+      setLoading(false);
     } finally {
       pendingFetchRef.current = false;
     }
