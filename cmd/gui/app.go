@@ -104,6 +104,8 @@ func cleanupOldDBFiles(tmpDir string) {
 		if err := os.Remove(filePath); err == nil {
 			log.Printf("Cleaned up old db file: %s", name)
 		}
+		os.Remove(filePath + "-wal")
+		os.Remove(filePath + "-shm")
 	}
 }
 

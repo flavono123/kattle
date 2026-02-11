@@ -63,7 +63,7 @@ export function useResourceData(
   // Serialize selectedFields for stable dependency comparison (avoid restart on same content, different reference)
   const selectedFieldsKey = JSON.stringify(selectedFields);
 
-  // Debounced preview field - stabilizes after 250ms of no changes
+  // Debounced preview field - stabilizes after 200ms of no changes
   const [debouncedPreviewField, setDebouncedPreviewField] = useState<string | undefined>(undefined);
   // Ref for main watch effect to include preview field without adding it as a dependency.
   // Prevents restart loop: preview effect → restart → extractedFieldsRef cleared → preview re-fires.
