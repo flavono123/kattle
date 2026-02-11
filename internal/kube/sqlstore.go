@@ -232,6 +232,7 @@ func (s *SQLStore) Get(key string) (map[string]any, error) {
 // GetByKeys retrieves multiple resources by their keys.
 // Returns a slice of maps containing the stored field values.
 // Each map includes "_context" field extracted from the key.
+// Batches queries to stay within SQLite's 999 variable limit.
 func (s *SQLStore) GetByKeys(keys []string) ([]map[string]any, error) {
 	if len(keys) == 0 {
 		return nil, nil
@@ -240,51 +241,61 @@ func (s *SQLStore) GetByKeys(keys []string) ([]map[string]any, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Build query with placeholders
-	placeholders := make([]string, len(keys))
-	args := make([]any, len(keys))
-	for i, key := range keys {
-		placeholders[i] = "?"
-		args[i] = key
-	}
-
-	query := fmt.Sprintf(
-		"SELECT key, data FROM resources WHERE key IN (%s)",
-		strings.Join(placeholders, ","),
-	)
-
-	rows, err := s.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query resources: %w", err)
-	}
-	defer rows.Close()
-
+	const maxBatchSize = 900 // SQLite default SQLITE_MAX_VARIABLE_NUMBER is 999
 	result := make([]map[string]any, 0, len(keys))
-	for rows.Next() {
-		var key string
-		var data []byte
-		if err := rows.Scan(&key, &data); err != nil {
-			log.Printf("Warning: failed to scan row: %v", err)
-			continue
+
+	for start := 0; start < len(keys); start += maxBatchSize {
+		end := start + maxBatchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batch := keys[start:end]
+
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, key := range batch {
+			placeholders[i] = "?"
+			args[i] = key
 		}
 
-		var obj map[string]any
-		if err := json.Unmarshal(data, &obj); err != nil {
-			log.Printf("Warning: failed to unmarshal data for %s: %v", key, err)
-			continue
+		query := fmt.Sprintf(
+			"SELECT key, data FROM resources WHERE key IN (%s)",
+			strings.Join(placeholders, ","),
+		)
+
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query resources: %w", err)
 		}
 
-		// Extract context from key (format: "context/namespace/name")
-		parts := strings.SplitN(key, "/", 2)
-		if len(parts) > 0 {
-			obj["_context"] = parts[0]
+		for rows.Next() {
+			var key string
+			var data []byte
+			if err := rows.Scan(&key, &data); err != nil {
+				log.Printf("Warning: failed to scan row: %v", err)
+				continue
+			}
+
+			var obj map[string]any
+			if err := json.Unmarshal(data, &obj); err != nil {
+				log.Printf("Warning: failed to unmarshal data for %s: %v", key, err)
+				continue
+			}
+
+			// Extract context from key (format: "context/namespace/name")
+			parts := strings.SplitN(key, "/", 2)
+			if len(parts) > 0 {
+				obj["_context"] = parts[0]
+			}
+
+			result = append(result, obj)
 		}
 
-		result = append(result, obj)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating rows: %w", err)
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("error iterating rows: %w", err)
+		}
+		rows.Close()
 	}
 
 	return result, nil
@@ -294,6 +305,26 @@ func (s *SQLStore) GetByKeys(keys []string) ([]map[string]any, error) {
 func (s *SQLStore) DeleteByContext(context string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Collect rowids for FTS cleanup before deleting
+	if s.hasFTS {
+		rows, err := s.db.Query("SELECT rowid FROM resources WHERE context = ?", context)
+		if err == nil {
+			var rowids []int64
+			for rows.Next() {
+				var rowid int64
+				if err := rows.Scan(&rowid); err == nil {
+					rowids = append(rowids, rowid)
+				}
+			}
+			rows.Close()
+			for _, rowid := range rowids {
+				if _, err := s.db.Exec("INSERT INTO resources_fts(resources_fts, rowid, name, namespace) VALUES('delete', ?, '', '')", rowid); err != nil {
+					log.Printf("Warning: FTS delete failed for rowid %d: %v", rowid, err)
+				}
+			}
+		}
+	}
 
 	_, err := s.db.Exec("DELETE FROM resources WHERE context = ?", context)
 	if err != nil {

@@ -54,6 +54,7 @@ type App struct {
 	watchDone       chan struct{}
 	fieldStore      *kube.FieldStore    // key: "context/namespace/name" → value: extracted fields
 	sqlStore        *kube.SQLStore      // SQLite-based store (enabled via KATTLE_USE_SQLSTORE=1)
+	sqlStoreDBPath  string              // SQLite file path for cleanup on shutdown
 	extractedFields map[string]struct{} // fields that were extracted during initial sync (for SQLStore mode)
 }
 
@@ -150,6 +151,7 @@ func (a *App) startup(ctx context.Context) {
 			log.Printf("failed to create SQLStore: %v", err)
 		} else {
 			a.sqlStore = sqlStore
+			a.sqlStoreDBPath = dbPath
 			log.Printf("SQLStore initialized (file: %s)", dbPath)
 		}
 	}
@@ -161,12 +163,19 @@ func (a *App) shutdown(ctx context.Context) {
 	log.Printf("App shutting down, cleaning up resources...")
 	a.StopWatch()
 
-	// Close SQLStore
+	// Close SQLStore and remove DB files
 	if a.sqlStore != nil {
 		if err := a.sqlStore.Close(); err != nil {
 			log.Printf("Warning: failed to close SQLStore: %v", err)
 		}
 		a.sqlStore = nil
+
+		if a.sqlStoreDBPath != "" {
+			for _, suffix := range []string{"", "-wal", "-shm"} {
+				os.Remove(a.sqlStoreDBPath + suffix)
+			}
+			log.Printf("Removed SQLite files: %s", a.sqlStoreDBPath)
+		}
 	}
 
 	log.Printf("App shutdown complete")
