@@ -119,7 +119,11 @@ func NewSQLStore(dbPath string) (*SQLStore, error) {
 	stmtUpsert, err := db.Prepare(`
 		INSERT INTO resources (key, context, namespace, name, data)
 		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(key) DO UPDATE SET data = excluded.data
+		ON CONFLICT(key) DO UPDATE SET
+			context = excluded.context,
+			namespace = excluded.namespace,
+			name = excluded.name,
+			data = excluded.data
 	`)
 	if err != nil {
 		db.Close()
@@ -454,19 +458,7 @@ func (s *SQLStore) GetRange(start, end int, sortField string, sortDesc bool) ([]
 		return nil, nil
 	}
 
-	// Build ORDER BY clause
-	// For JSON fields, we use json_extract
-	orderBy := "name ASC" // default sort
-	if sortField != "" && isValidSortField(sortField) {
-		// Convert dot notation to SQLite json_extract path
-		// e.g., "metadata.creationTimestamp" -> json_extract(data, '$.metadata.creationTimestamp')
-		jsonPath := "$." + sortField
-		direction := "ASC"
-		if sortDesc {
-			direction = "DESC"
-		}
-		orderBy = fmt.Sprintf("json_extract(data, '%s') %s", jsonPath, direction)
-	}
+	orderBy := buildOrderByClause(sortField, sortDesc)
 
 	query := fmt.Sprintf(`
 		SELECT key, context, data FROM resources
@@ -548,17 +540,38 @@ func buildWhereClause(params QueryParams, useFTS bool) (string, []any) {
 	return "WHERE " + strings.Join(whereClauses, " AND "), args
 }
 
+// sortFieldToColumn maps known JSON paths to indexed table columns.
+// Returns empty string if the field has no corresponding column.
+func sortFieldToColumn(sortField string) string {
+	switch sortField {
+	case "metadata.name":
+		return "name"
+	case "metadata.namespace":
+		return "namespace"
+	case "_context":
+		return "context"
+	default:
+		return ""
+	}
+}
+
 // buildOrderByClause builds ORDER BY clause from sort parameters.
+// Uses indexed columns for known fields, json_extract for others.
 func buildOrderByClause(sortField string, sortDesc bool) string {
 	if sortField == "" || !isValidSortField(sortField) {
 		return "name ASC"
 	}
 
-	jsonPath := fmt.Sprintf("json_extract(data, '$.%s')", sortField)
 	direction := "ASC"
 	if sortDesc {
 		direction = "DESC"
 	}
+
+	if col := sortFieldToColumn(sortField); col != "" {
+		return fmt.Sprintf("%s %s", col, direction)
+	}
+
+	jsonPath := fmt.Sprintf("json_extract(data, '$.%s')", sortField)
 	return fmt.Sprintf("%s %s", jsonPath, direction)
 }
 
