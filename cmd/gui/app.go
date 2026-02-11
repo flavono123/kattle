@@ -949,6 +949,7 @@ func (a *App) SetSelectedFields(fields []string) SetSelectedFieldsResult {
 	controllers := make([]*watchController, len(a.controllers))
 	copy(controllers, a.controllers)
 	ss := a.sqlStore
+	watchDone := a.watchDone // capture for goroutine cancellation
 
 	// Unlock BEFORE LIST calls to avoid blocking the event handler goroutines
 	a.watchMu.Unlock()
@@ -959,8 +960,22 @@ func (a *App) SetSelectedFields(fields []string) SetSelectedFieldsResult {
 
 	log.Printf("[DEBUG] SetSelectedFields: cache miss for %d new fields (async): %v", len(newFields), newFields)
 
+	// isCancelled checks if the watch has been stopped since this goroutine started.
+	isCancelled := func() bool {
+		if watchDone == nil {
+			return true
+		}
+		select {
+		case <-watchDone:
+			return true
+		default:
+			return false
+		}
+	}
+
 	// Async extraction: goroutine waits for controllers (if sync in progress),
 	// then LIST + re-extract, emits "fields:ready" when done.
+	// Checks watchDone at each step to avoid upserting stale data after StopWatch.
 	go func() {
 		ctrls := controllers
 
@@ -968,6 +983,10 @@ func (a *App) SetSelectedFields(fields []string) SetSelectedFieldsResult {
 		if len(ctrls) == 0 {
 			log.Printf("[DEBUG] SetSelectedFields goroutine: waiting for controllers...")
 			for i := 0; i < 600; i++ { // 30s max (600 * 50ms)
+				if isCancelled() {
+					log.Printf("[DEBUG] SetSelectedFields goroutine: cancelled while waiting for controllers")
+					return
+				}
 				time.Sleep(50 * time.Millisecond)
 				a.watchMu.RLock()
 				ctrls = make([]*watchController, len(a.controllers))
@@ -979,17 +998,29 @@ func (a *App) SetSelectedFields(fields []string) SetSelectedFieldsResult {
 			}
 			if len(ctrls) == 0 {
 				log.Printf("Warning: SetSelectedFields goroutine timed out waiting for controllers")
-				runtime.EventsEmit(a.ctx, "fields:ready")
+				if !isCancelled() {
+					runtime.EventsEmit(a.ctx, "fields:ready")
+				}
 				return
 			}
 			log.Printf("[DEBUG] SetSelectedFields goroutine: got %d controllers", len(ctrls))
 		}
 
 		for _, wc := range ctrls {
+			if isCancelled() {
+				log.Printf("[DEBUG] SetSelectedFields goroutine: cancelled before LIST for %s", wc.contextName)
+				return
+			}
+
 			list, err := wc.controller.ListAll()
 			if err != nil {
 				log.Printf("Warning: ListAll failed for context %s: %v", wc.contextName, err)
 				continue
+			}
+
+			if isCancelled() {
+				log.Printf("[DEBUG] SetSelectedFields goroutine: cancelled after LIST for %s", wc.contextName)
+				return
 			}
 
 			for i := range list.Items {
@@ -1009,8 +1040,12 @@ func (a *App) SetSelectedFields(fields []string) SetSelectedFieldsResult {
 			log.Printf("[DEBUG] SetSelectedFields: re-extracted %d resources for context %s (async)", len(list.Items), wc.contextName)
 		}
 
-		// Notify frontend that extraction is complete
-		runtime.EventsEmit(a.ctx, "fields:ready")
+		// Notify frontend only if watch is still active
+		if !isCancelled() {
+			runtime.EventsEmit(a.ctx, "fields:ready")
+		} else {
+			log.Printf("[DEBUG] SetSelectedFields goroutine: cancelled, skipping fields:ready emit")
+		}
 	}()
 
 	// Return immediately with Extracting=true (frontend shows skeleton)
