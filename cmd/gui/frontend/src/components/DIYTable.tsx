@@ -320,6 +320,10 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
   const loadingFields = useWindowedMode ? new Set<string>() : standardResult.loadingFields;  // Cell-level skeleton for loading fields
   const extractedFields = useWindowedMode ? new Set<string>() : standardResult.extractedFields;  // Fields extracted from backend
 
+  // Windowed mode skeleton: controlled by data itself, not by extractingFields state.
+  // Backend stores explicit null for extracted fields with no value (JSON null → JS null → "-").
+  // Missing keys in JSON → JS undefined → skeleton (field not yet extracted).
+
   // For windowed mode, data array contains ONLY loaded rows (~80) instead of totalCount placeholder objects.
   // This reduces TanStack Table row model from 6616 to ~80 items (98.8% reduction).
   // Skeleton rows are rendered directly in the virtualizer loop, bypassing TanStack.
@@ -985,7 +989,7 @@ export const DIYTable = forwardRef<DIYTableHandle, DIYTableProps>(({
                               setFocusedColIndex(cellIndex);
                             }}
                           >
-                            {windowedResult.extractingFields && value === undefined ? (
+                            {value === undefined ? (
                               <div className="h-4 bg-muted/50 rounded animate-pulse w-3/4" />
                             ) : (
                               <CellContent

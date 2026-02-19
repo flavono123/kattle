@@ -138,7 +138,13 @@ export function useWindowedData(
   const [error, setError] = useState<Error | null>(null);
   const [watchStatus, setWatchStatus] = useState<WatchStatus>('disconnected');
   const [initialSyncComplete, setInitialSyncComplete] = useState(false);
-  const [extractingFields, setExtractingFields] = useState(false);
+  const [extractingFields, setExtractingFieldsState] = useState(false);
+  const extractingFieldsRef = useRef(false);
+  // Update both state (for render) and ref (for event handler closures)
+  const setExtractingFields = useCallback((val: boolean) => {
+    extractingFieldsRef.current = val;
+    setExtractingFieldsState(val);
+  }, []);
   const [changedCells, setChangedCells] = useState<CellChange[]>([]);
 
   // Debounced preview field (200ms delay for hover)
@@ -435,6 +441,12 @@ export function useWindowedData(
       }
       // MODIFIED: no count change, just re-fetch data below
 
+      // Skip data re-fetch during field extraction to avoid showing stale data
+      // (goroutine is progressively updating SQLStore rows — intermediate reads
+      // would return old data without the new field, causing '-' instead of skeleton).
+      // fields:ready handler will trigger the re-fetch when extraction completes.
+      if (extractingFieldsRef.current) return;
+
       // Re-fetch visible range (data might have changed)
       // Reset last fetch range to force re-fetch
       lastFetchRangeRef.current = { start: -1, end: -1 };
@@ -501,32 +513,42 @@ export function useWindowedData(
 
     console.log('useWindowedData: SetSelectedFields with', allFields.length, 'fields',
       justConnected ? '(just connected)' : '(fields changed)');
+
+    // Set extractingFields BEFORE the async call for ANY field/preview change.
+    // This ensures skeleton renders immediately instead of showing '-'.
+    // justConnected without field change doesn't need skeleton (same fields, just re-sync).
+    if (fieldsChanged || previewChanged) {
+      setExtractingFields(true);
+    }
+
     SetSelectedFields(allFields)
-      .then((result) => {
+      .then(async (result) => {
         if (result.extracting) {
-          // Async extraction in progress - keep existing data visible.
-          // New/changed fields show skeleton via extractingFields && value === undefined.
-          // Re-fetch with all fields happens on fields:ready event.
-          setExtractingFields(true);
+          // Async extraction in progress.
+          // extractingFields already set above. fields:ready will handle completion.
         } else {
-          // Cache hit → immediately re-fetch
-          setExtractingFields(false);
+          // Cache hit → re-fetch data first, then clear extracting.
+          // Awaiting fetch ensures visibleRows has fresh data before skeleton clears.
           lastFetchRangeRef.current = { start: -1, end: -1 };
-          fetchRangeRef.current();
+          await fetchRangeRef.current();
+          setExtractingFields(false);
         }
       })
       .catch((err) => {
         console.error('useWindowedData: SetSelectedFields failed:', err);
+        setExtractingFields(false);
       });
   }, [selectedFieldsKey, debouncedPreview, watchStatus, gvk, selectedFields]);
 
   // Listen for fields:ready event (async extraction complete)
+  // Don't clear extractingFields here - clear it AFTER re-fetch completes
+  // to keep skeleton visible until actual data arrives.
   useEffect(() => {
-    const cleanup = EventsOn('fields:ready', () => {
+    const cleanup = EventsOn('fields:ready', async () => {
       console.log('useWindowedData: fields:ready received, re-fetching');
-      setExtractingFields(false);
       lastFetchRangeRef.current = { start: -1, end: -1 };
-      fetchRangeRef.current();
+      await fetchRangeRef.current();
+      setExtractingFields(false);
     });
     return cleanup;
   }, []);

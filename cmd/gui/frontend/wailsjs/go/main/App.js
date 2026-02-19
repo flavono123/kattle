@@ -42,10 +42,6 @@ export function GetResourceCountFiltered(arg1) {
   return window['go']['main']['App']['GetResourceCountFiltered'](arg1);
 }
 
-export function GetResources(arg1, arg2) {
-  return window['go']['main']['App']['GetResources'](arg1, arg2);
-}
-
 export function GetResourcesByKeys(arg1) {
   return window['go']['main']['App']['GetResourcesByKeys'](arg1);
 }
