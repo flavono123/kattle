@@ -637,16 +637,38 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 		}
 	}()
 
+	// Collect valid GVRs first, so we can pre-add to eventWg before goroutines start.
+	// This prevents the watchDone goroutine from seeing eventWg counter=0 and closing
+	// watchDone before any event forwarder goroutines have been registered.
+	type contextGVR struct {
+		contextName string
+		gvr         schema.GroupVersionResource
+	}
+	var validContexts []contextGVR
 	for _, contextName := range contexts {
 		gvr, err := kube.GetGVRForContext(contextName, schemaGVK)
 		if err != nil {
 			log.Printf("Warning: failed to get GVR for %s in context %s: %v", schemaGVK.Kind, contextName, err)
 			continue
 		}
+		validContexts = append(validContexts, contextGVR{contextName, gvr})
+	}
 
-		syncWg.Add(1)
+	// Pre-add to WaitGroups so Wait() won't return prematurely
+	syncWg.Add(len(validContexts))
+	eventWg.Add(len(validContexts))
+
+	for _, cg := range validContexts {
 		go func(ctx string, gvr schema.GroupVersionResource) {
 			defer syncWg.Done()
+
+			// If informer fails, still release the pre-added eventWg count
+			informerOk := false
+			defer func() {
+				if !informerOk {
+					eventWg.Done()
+				}
+			}()
 
 			controller := kube.NewResourceControllerForContext(ctx, gvr)
 
@@ -720,7 +742,7 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 			mu.Unlock()
 
 			// Start goroutine to forward ONGOING events to frontend (after initial sync).
-			eventWg.Add(1)
+			informerOk = true // prevent deferred eventWg.Done()
 			go func(ctxName string, ctrl *kube.ResourceController) {
 				defer eventWg.Done()
 				for {
@@ -809,7 +831,7 @@ func (a *App) StartWatch(gvk MultiClusterGVK, contexts []string, selectedFields 
 					}
 				}
 			}(ctx, controller)
-		}(contextName, gvr)
+		}(cg.contextName, cg.gvr)
 	}
 
 	// Background goroutine: wait for all initial syncs, then emit sync:complete
