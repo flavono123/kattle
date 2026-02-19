@@ -502,11 +502,20 @@ func extractFieldsForSQL(obj *unstructured.Unstructured, selectedFields []string
 			extractedParents[parentPath] = struct{}{}
 			if val, found, err := unstructured.NestedFieldCopy(obj.Object, parts[:wildcardIdx]...); err == nil && found {
 				setNestedField(result, parentPath, val)
+			} else {
+				// Explicit null: "extracted but parent doesn't exist"
+				// Frontend uses null vs undefined to distinguish extracted-empty from not-yet-extracted.
+				setNestedField(result, parentPath, nil)
 			}
 		} else {
 			// Normal path without wildcard
 			if val, found, err := unstructured.NestedFieldCopy(obj.Object, parts...); err == nil && found {
 				setNestedField(result, path, val)
+			} else {
+				// Explicit null: "extracted but field doesn't exist in this resource"
+				// JSON null → JS null → CellContent shows "-"
+				// vs JSON key absent → JS undefined → skeleton (not yet extracted)
+				setNestedField(result, path, nil)
 			}
 		}
 	}
