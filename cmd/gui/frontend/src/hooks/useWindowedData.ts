@@ -168,7 +168,10 @@ export function useWindowedData(
   // Stable ref to fetchRange_ — updated each render, used in effects to avoid stale closures
   const fetchRangeRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
-  // Computed fetch range (visible + overscan)
+  // Snapshot of fetch range for debugging/display only.
+  // Intentionally uses ref.current in deps: ref mutations don't trigger re-renders,
+  // so this value is stale between renders. The actual fetch range is computed
+  // fresh inside fetchRange_ using visibleRangeRef directly.
   const fetchRange = useMemo(() => ({
     start: Math.max(0, visibleRangeRef.current.start - overscan),
     end: visibleRangeRef.current.end + overscan,
