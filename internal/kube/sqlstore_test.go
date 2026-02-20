@@ -648,3 +648,218 @@ func TestEscapeLike(t *testing.T) {
 		})
 	}
 }
+
+func TestIsValidSortField(t *testing.T) {
+	tests := []struct {
+		field string
+		valid bool
+	}{
+		{"", true},
+		{"metadata.name", true},
+		{"metadata.namespace", true},
+		{"status.phase", true},
+		{"spec.containers.0.image", true},           // numeric index with dots, all valid chars
+		{"metadata.labels.app-name", true},          // hyphens allowed
+		{"metadata.labels.app_name", true},          // underscores allowed
+		{"metadata.name; DROP TABLE resources", false}, // SQL injection: semicolon
+		{"metadata.name' OR '1'='1", false},         // SQL injection: quotes
+		{"metadata.name\"; --", false},              // SQL injection: double quote
+		{"field with spaces", false},                // spaces not allowed
+		{"field\ttab", false},                       // tabs not allowed
+		{"field()", false},                          // parens not allowed
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.field, func(t *testing.T) {
+			result := isValidSortField(tt.field)
+			assert.Equal(t, tt.valid, result)
+		})
+	}
+}
+
+func TestBuildFilterClause(t *testing.T) {
+	t.Run("contains", func(t *testing.T) {
+		clause, args := buildFilterClause(Filter{
+			Field: "metadata.name",
+			Op:    FilterOpContains,
+			Value: "test",
+		})
+		assert.Contains(t, clause, "LIKE")
+		assert.Equal(t, []any{"%test%"}, args)
+	})
+
+	t.Run("equals", func(t *testing.T) {
+		clause, args := buildFilterClause(Filter{
+			Field: "metadata.namespace",
+			Op:    FilterOpEquals,
+			Value: "default",
+		})
+		assert.Contains(t, clause, "= ?")
+		assert.Equal(t, []any{"default"}, args)
+	})
+
+	t.Run("startsWith", func(t *testing.T) {
+		clause, args := buildFilterClause(Filter{
+			Field: "metadata.name",
+			Op:    FilterOpStartsWith,
+			Value: "web-",
+		})
+		assert.Contains(t, clause, "LIKE")
+		assert.Equal(t, []any{"web-%"}, args)
+	})
+
+	t.Run("in with string slice", func(t *testing.T) {
+		clause, args := buildFilterClause(Filter{
+			Field: "metadata.namespace",
+			Op:    FilterOpIn,
+			Value: []string{"default", "kube-system"},
+		})
+		assert.Contains(t, clause, "IN")
+		assert.Len(t, args, 2)
+	})
+
+	t.Run("in with any slice (JSON unmarshal)", func(t *testing.T) {
+		clause, args := buildFilterClause(Filter{
+			Field: "metadata.namespace",
+			Op:    FilterOpIn,
+			Value: []any{"default", "kube-system"},
+		})
+		assert.Contains(t, clause, "IN")
+		assert.Len(t, args, 2)
+	})
+
+	t.Run("gt", func(t *testing.T) {
+		clause, args := buildFilterClause(Filter{
+			Field: "spec.replicas",
+			Op:    FilterOpGt,
+			Value: float64(3),
+		})
+		assert.Contains(t, clause, "> ?")
+		assert.Equal(t, []any{float64(3)}, args)
+	})
+
+	t.Run("invalid field rejects SQL injection", func(t *testing.T) {
+		clause, args := buildFilterClause(Filter{
+			Field: "field; DROP TABLE resources",
+			Op:    FilterOpEquals,
+			Value: "test",
+		})
+		assert.Empty(t, clause)
+		assert.Nil(t, args)
+	})
+
+	t.Run("contains with special LIKE chars", func(t *testing.T) {
+		clause, args := buildFilterClause(Filter{
+			Field: "metadata.name",
+			Op:    FilterOpContains,
+			Value: "100%_match",
+		})
+		assert.Contains(t, clause, "LIKE")
+		assert.Equal(t, []any{`%100\%\_match%`}, args)
+	})
+}
+
+func TestSortFieldToColumn(t *testing.T) {
+	assert.Equal(t, "name", sortFieldToColumn("metadata.name"))
+	assert.Equal(t, "namespace", sortFieldToColumn("metadata.namespace"))
+	assert.Equal(t, "context", sortFieldToColumn("_context"))
+	assert.Equal(t, "", sortFieldToColumn("status.phase"))
+	assert.Equal(t, "", sortFieldToColumn("spec.replicas"))
+}
+
+func TestBuildOrderByClause(t *testing.T) {
+	// Default (empty sort field)
+	assert.Equal(t, "name ASC", buildOrderByClause("", false))
+
+	// Indexed column
+	assert.Equal(t, "name ASC", buildOrderByClause("metadata.name", false))
+	assert.Equal(t, "name DESC", buildOrderByClause("metadata.name", true))
+	assert.Equal(t, "namespace ASC", buildOrderByClause("metadata.namespace", false))
+
+	// JSON extract for non-indexed fields
+	assert.Equal(t, "json_extract(data, '$.status.phase') ASC", buildOrderByClause("status.phase", false))
+	assert.Equal(t, "json_extract(data, '$.status.phase') DESC", buildOrderByClause("status.phase", true))
+
+	// Invalid sort field falls back to default
+	assert.Equal(t, "name ASC", buildOrderByClause("field; DROP TABLE", false))
+}
+
+func TestBuildWhereClause(t *testing.T) {
+	t.Run("empty params", func(t *testing.T) {
+		clause, args := buildWhereClause(QueryParams{}, true)
+		assert.Empty(t, clause)
+		assert.Nil(t, args)
+	})
+
+	t.Run("search with FTS", func(t *testing.T) {
+		clause, args := buildWhereClause(QueryParams{Search: "nginx"}, true)
+		assert.Contains(t, clause, "WHERE")
+		assert.Contains(t, clause, "resources_fts MATCH")
+		assert.Equal(t, []any{"nginx"}, args)
+	})
+
+	t.Run("search without FTS", func(t *testing.T) {
+		clause, args := buildWhereClause(QueryParams{Search: "nginx"}, false)
+		assert.Contains(t, clause, "WHERE")
+		assert.Contains(t, clause, "LIKE")
+		assert.Len(t, args, 3) // name, namespace, status.phase
+	})
+
+	t.Run("filters combined with AND", func(t *testing.T) {
+		params := QueryParams{
+			Filters: []Filter{
+				{Field: "metadata.namespace", Op: FilterOpEquals, Value: "default"},
+				{Field: "status.phase", Op: FilterOpEquals, Value: "Running"},
+			},
+		}
+		clause, args := buildWhereClause(params, true)
+		assert.Contains(t, clause, "AND")
+		assert.Len(t, args, 2)
+	})
+
+	t.Run("search and filters combined", func(t *testing.T) {
+		params := QueryParams{
+			Search: "web",
+			Filters: []Filter{
+				{Field: "metadata.namespace", Op: FilterOpEquals, Value: "default"},
+			},
+		}
+		clause, args := buildWhereClause(params, true)
+		assert.Contains(t, clause, "AND")
+		assert.Len(t, args, 2) // FTS search + 1 filter
+	})
+}
+
+func TestSQLStore_GetByKeys_Batching(t *testing.T) {
+	store, err := NewSQLStore(":memory:")
+	require.NoError(t, err)
+	defer store.Close()
+
+	// Insert more than maxBatchSize (900) resources
+	const totalKeys = 950
+	keys := make([]string, totalKeys)
+	for i := range totalKeys {
+		name := fmt.Sprintf("pod-%04d", i)
+		key := fmt.Sprintf("ctx/default/%s", name)
+		keys[i] = key
+
+		data, _ := json.Marshal(map[string]any{
+			"metadata": map[string]any{
+				"name":      name,
+				"namespace": "default",
+			},
+		})
+		err := store.Upsert(key, "ctx", "default", name, data)
+		require.NoError(t, err)
+	}
+
+	// GetByKeys should handle batching transparently
+	results, err := store.GetByKeys(keys)
+	require.NoError(t, err)
+	assert.Len(t, results, totalKeys, "should return all %d resources across batch boundaries", totalKeys)
+
+	// Verify _context is populated for all results
+	for _, r := range results {
+		assert.Equal(t, "ctx", r["_context"])
+	}
+}
