@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.0.11-alpha](https://github.com/flavono123/kattle/compare/v0.0.10-alpha...v0.0.11-alpha) (2026-02-21)
+
+
+### Features
+
+* **claude:** add worktree strategy and update retry policy ([1f2190d](https://github.com/flavono123/kattle/commit/1f2190d75112e9518844b09cab073528bcfa3852))
+* **gui:** add column sorting & reordering by drags to ResultTable ([#44](https://github.com/flavono123/kattle/issues/44)) ([49d85bb](https://github.com/flavono123/kattle/commit/49d85bb455bb9b60464f9bc23bc448bf53fc15f8))
+* **gui:** add pulse animation to CTA buttons for better visibility ([#33](https://github.com/flavono123/kattle/issues/33)) ([26b2035](https://github.com/flavono123/kattle/commit/26b203594f746eb856df7b27100a721e60d8c54e))
+* **gui:** auto-select additionalPrinterColumns for CRD resources ([#51](https://github.com/flavono123/kattle/issues/51)) ([d1f49cc](https://github.com/flavono123/kattle/commit/d1f49cc93ee12c6c1c9266171c76f50a796ae68c))
+* **gui:** bidirectional focus sync between NavigationPanel and ResultTable ([#45](https://github.com/flavono123/kattle/issues/45)) ([32d521e](https://github.com/flavono123/kattle/commit/32d521e601250059f3fe223a061bed9e77a7cc9c))
+* **gui:** comprehensive keyboard navigation support ([#40](https://github.com/flavono123/kattle/issues/40)) ([9ec8740](https://github.com/flavono123/kattle/commit/9ec8740c734876de0b168e5344d5aba3170cac8d))
+* **kube:** Go backend memory optimization ([#61](https://github.com/flavono123/kattle/issues/61)) ([387bc52](https://github.com/flavono123/kattle/commit/387bc522d550027dbf56c8f0257ce7eaacf28e24))
+* **kube:** SQLite storage with Pull Model for memory optimization ([#62](https://github.com/flavono123/kattle/issues/62)) ([0e085e5](https://github.com/flavono123/kattle/commit/0e085e552862726e0938efd1f80f9ee241903dec))
+* **nav:** add wildcard (*) node for bulk selection of child fields ([#52](https://github.com/flavono123/kattle/issues/52)) ([607ac08](https://github.com/flavono123/kattle/commit/607ac08ebe82a80e0741538143aefe5f2236682f))
+* **search:** use API shortNames for GVK search ([#54](https://github.com/flavono123/kattle/issues/54)) ([c5a3a09](https://github.com/flavono123/kattle/commit/c5a3a091a8bd921b5ab838ac707b801c618b7caa))
+* **ui:** add resizable table columns and improve cell styling ([#32](https://github.com/flavono123/kattle/issues/32)) ([5bea584](https://github.com/flavono123/kattle/commit/5bea584c20587412f0792a239dc044fb9392ead4))
+* **ui:** improve UX with layout alignment and favorites popover ([#53](https://github.com/flavono123/kattle/issues/53)) ([766d49c](https://github.com/flavono123/kattle/commit/766d49c3ea672ebf4bfc0f9a3bb31f092ed9b531))
+* **ui:** move resource count display to search bar right side ([#50](https://github.com/flavono123/kattle/issues/50)) ([bebbb89](https://github.com/flavono123/kattle/commit/bebbb895ee721397f3febe9aaf622f0159a6feb3))
+
+
+### Bug Fixes
+
+* **ci:** update GitHub Actions to latest versions ([#38](https://github.com/flavono123/kattle/issues/38)) ([f87e4db](https://github.com/flavono123/kattle/commit/f87e4db0baaa00deb9f11a59a3d4517c5388da58))
+* **gui:** prevent selection from being immediately removed in NavigationPanel ([#42](https://github.com/flavono123/kattle/issues/42)) ([17c9411](https://github.com/flavono123/kattle/commit/17c94110bfd3dca6e025891dc09216f885635b8b))
+* **gui:** resolve search input keyboard issues and improve focus management ([#41](https://github.com/flavono123/kattle/issues/41)) ([9d92d47](https://github.com/flavono123/kattle/commit/9d92d472d2309dbd4fe2fbb2866335505723e874))
+* **gui:** sync CSV export with selected fields only ([#46](https://github.com/flavono123/kattle/issues/46)) ([5ee9589](https://github.com/flavono123/kattle/commit/5ee9589d27bd58c1ab33d05a1c436022e5865c8f))
+* **gui:** use resolvedTheme for correct theme toggle behavior ([#34](https://github.com/flavono123/kattle/issues/34)) ([d023e56](https://github.com/flavono123/kattle/commit/d023e563d06fdeb8a100f168e20ca718f4bc6b14))
+* **kube:** prevent object array items from being pickable ([#26](https://github.com/flavono123/kattle/issues/26)) ([8c5744d](https://github.com/flavono123/kattle/commit/8c5744d3241bc9ad76e18a6b0360617c574efd81))
+* **memory:** implement Pull Model to prevent WebView memory leak ([#49](https://github.com/flavono123/kattle/issues/49)) ([63468b3](https://github.com/flavono123/kattle/commit/63468b34945aae7cc23f9d0b9f27b122f7fa3fea))
+* resolve UX bugs in favorites and resource data handling ([#59](https://github.com/flavono123/kattle/issues/59)) ([d65b257](https://github.com/flavono123/kattle/commit/d65b2579077a51c80e4980f8b65b15bc09193c37))
+* **test:** remove type assertion violating CODE_QUALITY.md ([#58](https://github.com/flavono123/kattle/issues/58)) ([15a637b](https://github.com/flavono123/kattle/commit/15a637b6653a1a7869e05f6f59f3e45f17cb3be9))
+* **ui:** cap column width and truncate long values ([#27](https://github.com/flavono123/kattle/issues/27)) ([9cf91ba](https://github.com/flavono123/kattle/commit/9cf91bae198c01f07f0978d7dc0b91f094824917))
+* **website:** add trailing slash to base path ([#39](https://github.com/flavono123/kattle/issues/39)) ([627603b](https://github.com/flavono123/kattle/commit/627603b64c6aa262a0772389d59df3d3de7e7f63))
+* **website:** add trailing slash to base path for correct URL generation ([627603b](https://github.com/flavono123/kattle/commit/627603b64c6aa262a0772389d59df3d3de7e7f63))
+* **website:** change base path to /kupid to match repo name ([8fed254](https://github.com/flavono123/kattle/commit/8fed254bbb7b096c09b56eb546a2054e49b2e40a))
+* **website:** update base path from kupid to kattle ([1e1a8af](https://github.com/flavono123/kattle/commit/1e1a8aff0f40f48d50324ef8d5a9133f4d49a29d))
+
 ## [0.0.10-alpha](https://github.com/flavono123/kupid/compare/v0.0.9-alpha...v0.0.10-alpha) (2025-01-30)
 
 
