@@ -16,6 +16,8 @@ export interface UseResourceDataOptions {
    * Pass this to enable memory-efficient selective field extraction.
    * Without this, only essential metadata fields are returned. */
   selectedFields?: string[];
+  /** Preview field path (for hover preview). Debounced and fetched to show actual values. */
+  previewField?: string;
 }
 
 export interface UseResourceDataResult {
@@ -33,6 +35,10 @@ export interface UseResourceDataResult {
   getRowId: (row: any) => string;
   /** Cells that changed in the most recent batch update */
   changedCells: CellChange[];
+  /** Field paths currently being loaded (for skeleton UI) */
+  loadingFields: Set<string>;
+  /** Field paths that have been extracted from backend (for skeleton decision) */
+  extractedFields: Set<string>;
 }
 
 /**
@@ -52,16 +58,53 @@ export function useResourceData(
   contexts: string[],
   options: UseResourceDataOptions = {}
 ): UseResourceDataResult {
-  const { watch = true, batchInterval = 100, selectedFields = [] } = options;
+  const { watch = true, batchInterval = 100, selectedFields = [], previewField } = options;
 
   // Serialize selectedFields for stable dependency comparison (avoid restart on same content, different reference)
   const selectedFieldsKey = JSON.stringify(selectedFields);
+
+  // Debounced preview field - stabilizes after 200ms of no changes
+  const [debouncedPreviewField, setDebouncedPreviewField] = useState<string | undefined>(undefined);
+  // Ref for main watch effect to include preview field without adding it as a dependency.
+  // Prevents restart loop: preview effect → restart → extractedFieldsRef cleared → preview re-fires.
+  const debouncedPreviewFieldRef = useRef<string | undefined>(undefined);
+  debouncedPreviewFieldRef.current = debouncedPreviewField;
+
+  // Debounce previewField changes (200ms for hover to feel responsive)
+  useEffect(() => {
+    if (!previewField) {
+      // Don't clear immediately - keep the last preview field in memory
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setDebouncedPreviewField(previewField);
+    }, 200);
+
+    return () => clearTimeout(timer);
+  }, [previewField]);
 
   const [data, setData] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [watchStatus, setWatchStatus] = useState<WatchStatus>('disconnected');
   const [changedCells, setChangedCells] = useState<CellChange[]>([]);
+
+  // State to force main effect re-run when watch is restarted for field changes (SQLStore mode)
+  const [fieldChangeRestartKey, setFieldChangeRestartKey] = useState(0);
+
+  // Track fields currently being loaded (for cell-level skeleton UI)
+  const [loadingFields, setLoadingFields] = useState<Set<string>>(new Set());
+
+  // Track which fields have been extracted (for skeleton decision in UI)
+  // Fields not in this set have no data yet and should show skeleton
+  const [extractedFields, setExtractedFields] = useState<Set<string>>(new Set());
+
+  // Ref version of extractedFields for use in effects (avoids stale closure issues)
+  const extractedFieldsRef = useRef<Set<string>>(new Set());
+
+  // Track if current restart is for field change only (skip full loading, use cell skeleton instead)
+  const isFieldChangeRestartRef = useRef(false);
 
   // Track watch generation to avoid stale operations
   const watchGenRef = useRef(0);
@@ -92,10 +135,11 @@ export function useResourceData(
   // Watch subscription
   useEffect(() => {
     if (!watch || !gvk || contexts.length === 0) {
-      setData([]);
-      setLoading(false);
-      setError(null);
-      setWatchStatus('disconnected');
+      // Only update state if needed to avoid infinite loops
+      setData(prev => prev.length === 0 ? prev : []);
+      setLoading(prev => prev === false ? prev : false);
+      setError(prev => prev === null ? prev : null);
+      setWatchStatus(prev => prev === 'disconnected' ? prev : 'disconnected');
       prevGvkRef.current = null;
       prevContextsKeyRef.current = '';
       return;
@@ -114,20 +158,33 @@ export function useResourceData(
     prevGvkRef.current = gvk;
     prevContextsKeyRef.current = currentContextsKey;
 
+    // Reset field-change restart flag (consumed by this run)
+    isFieldChangeRestartRef.current = false;
+
     const watchGen = ++watchGenRef.current;
     setError(null);
 
-    // Always show loading when starting a new watch - this is critical for React Strict Mode
-    // where the effect runs twice but only the first run clears data
-    setLoading(true);
+    // Show loading only for full restarts (GVK/context change).
+    // Field-change restarts use cell-level skeleton UI instead of full loading spinner.
+    if (shouldClearData) {
+      setLoading(true);
+    }
 
     // Only clear data if GVK or contexts changed
     if (shouldClearData) {
       console.log('useResourceData: clearing data (GVK or contexts changed)');
       setData([]);
+      // Clear loadingFields and extractedFields on full reset
+      setLoadingFields(new Set());
+      setExtractedFields(new Set());
+      extractedFieldsRef.current = new Set();
     }
 
-    setWatchStatus('connecting');
+    // Only change watchStatus if this is a full restart (not just a field/preview change)
+    // This prevents brief "no resources" flash during field changes
+    if (shouldClearData) {
+      setWatchStatus('connecting');
+    }
     pendingKeys.current.clear();
     pendingDeltaUpdates.current.clear();
     pendingDeletes.current.clear();
@@ -135,12 +192,25 @@ export function useResourceData(
     hasReceivedFirstBatch.current = false;
     hasReceivedAnyEvent.current = false;
 
+    // Fields to extract - include current preview field to prevent restart loop.
+    // Without this, preview effect triggers restart → extractedFieldsRef cleared →
+    // preview effect re-fires → infinite restart loop.
+    const currentPreview = debouncedPreviewFieldRef.current;
+    const allFieldsToExtract = currentPreview && !selectedFields.includes(currentPreview)
+      ? [...selectedFields, currentPreview]
+      : selectedFields;
+
     // Chain the start operation to ensure previous stop completes first
     const startOperation = watchOperationRef.current
       .then(() => StopWatch().catch(() => {})) // Stop any existing watch first, ignore errors
       .then(() => {
         if (watchGen !== watchGenRef.current) return;
-        return StartWatch(gvk, contexts, selectedFields);
+        // Track which fields are extracted in this watch session (including preview field)
+        // This is used by UI to show skeleton for fields not yet extracted
+        const newExtractedFields = new Set(allFieldsToExtract);
+        extractedFieldsRef.current = newExtractedFields;
+        setExtractedFields(newExtractedFields);
+        return StartWatch(gvk, contexts, allFieldsToExtract);
       })
       .then(() => {
         if (watchGen !== watchGenRef.current) return;
@@ -251,10 +321,11 @@ export function useResourceData(
       unsubscribeResourceUpdate();
       setWatchStatus('disconnected');
     };
-    // NOTE: selectedFieldsKey is intentionally NOT a dependency here.
-    // Changing selectedFields should NOT restart the watch (which clears FieldStore).
-    // Instead, a separate effect handles selectedFields updates via SetSelectedFields API.
-  }, [watch, gvk, contexts]);
+    // NOTE: fieldChangeRestartKey is included to re-run this effect when
+    // the selectedFields effect determines a resync is needed (SQLStore mode).
+    // debouncedPreviewField is NOT a dependency - preview field changes are handled
+    // by a separate effect to avoid losing event subscriptions on early return.
+  }, [watch, gvk, contexts, fieldChangeRestartKey]);
 
   // Cleanup on unmount - ensure watch is stopped
   useEffect(() => {
@@ -268,8 +339,9 @@ export function useResourceData(
   // Track initial selectedFields to skip the first run (initial selectedFields passed to StartWatch)
   const initialSelectedFieldsKeyRef = useRef<string | null>(null);
 
-  // Handle selectedFields changes WITHOUT restarting watch
-  // This effect updates the backend field list and queues a re-fetch of all existing data
+  // Handle selectedFields changes - may restart watch if backend requires resync
+  // In SQLStore mode, adding new fields requires a watch restart because
+  // the original objects are not kept in memory for re-extraction.
   useEffect(() => {
     // Skip if watch is not active
     if (!watch || !gvk || watchStatus !== 'connected') {
@@ -290,13 +362,41 @@ export function useResourceData(
     // Update ref for next comparison
     initialSelectedFieldsKeyRef.current = selectedFieldsKey;
 
-    console.log('useResourceData: selectedFields changed, updating backend without watch restart');
+    console.log('useResourceData: selectedFields changed, checking if resync needed');
 
-    // Update backend selectedFields (new/modified resources will use new fields)
+    // Update backend selectedFields and check if resync is needed
     SetSelectedFields(selectedFields)
-      .then(async () => {
-        // Queue all existing keys for re-fetch to get data with new field extraction
-        // Note: Backend re-extracts data from FieldStore when fields change
+      .then(async (result) => {
+        // If backend indicates resync is needed (SQLStore mode with new fields),
+        // trigger a full watch restart by updating fieldChangeRestartKey.
+        // This causes the main watch effect to re-run with proper event subscriptions.
+        if (result && result.needsResync) {
+          // Calculate which fields are new (for skeleton UI)
+          // Use ref to avoid stale closure issues
+          const newFields = selectedFields.filter(f => !extractedFieldsRef.current.has(f));
+          console.log('useResourceData: backend requires resync for new fields:', newFields);
+
+          // Add new fields to loadingFields for skeleton UI
+          if (newFields.length > 0) {
+            setLoadingFields(prev => {
+              const next = new Set(prev);
+              for (const f of newFields) {
+                next.add(f);
+              }
+              return next;
+            });
+          }
+
+          // Mark this as field-change restart (skip full loading spinner)
+          isFieldChangeRestartRef.current = true;
+
+          // Trigger watch restart (this will clear loadingFields when data arrives)
+          setFieldChangeRestartKey(prev => prev + 1);
+          return;
+        }
+
+        // No resync needed (FieldStore mode or no new fields) - just re-fetch existing keys
+        console.log('useResourceData: no resync needed, queuing keys for re-fetch');
         try {
           const allKeys = await GetAllResourceKeys();
           if (allKeys && allKeys.length > 0) {
@@ -312,7 +412,63 @@ export function useResourceData(
       .catch((err) => {
         console.error('useResourceData: failed to update selectedFields:', err);
       });
-  }, [watch, gvk, watchStatus, selectedFieldsKey, selectedFields]);
+  }, [watch, gvk, contexts, watchStatus, selectedFieldsKey, selectedFields]);
+
+  // Handle debouncedPreviewField changes without restarting watch.
+  // This is separate from the main watch effect to avoid losing event subscriptions.
+  useEffect(() => {
+    if (!watch || !gvk || watchStatus !== 'connected') return;
+    if (!debouncedPreviewField) return;
+    if (extractedFieldsRef.current.has(debouncedPreviewField)) return;
+
+    console.log('useResourceData: preview field change, showing skeleton:', debouncedPreviewField);
+    setLoadingFields(prev => new Set([...prev, debouncedPreviewField]));
+
+    // Build combined fields: selected + preview
+    const allFields = [...selectedFields];
+    if (!allFields.includes(debouncedPreviewField)) {
+      allFields.push(debouncedPreviewField);
+    }
+
+    SetSelectedFields(allFields)
+      .then(async (result) => {
+        // Track the preview field as extracted
+        extractedFieldsRef.current.add(debouncedPreviewField);
+        setExtractedFields(new Set(extractedFieldsRef.current));
+
+        if (result && result.needsResync) {
+          console.log('useResourceData: preview field requires resync');
+          isFieldChangeRestartRef.current = true;
+          setFieldChangeRestartKey(prev => prev + 1);
+        } else {
+          // Queue keys for re-fetch to get preview field values
+          try {
+            const allKeys = await GetAllResourceKeys();
+            if (allKeys && allKeys.length > 0) {
+              for (const key of allKeys) {
+                pendingKeys.current.add(key);
+              }
+            }
+          } catch (err) {
+            console.error('useResourceData: preview field re-fetch failed:', err);
+          }
+        }
+
+        setLoadingFields(prev => {
+          const next = new Set(prev);
+          next.delete(debouncedPreviewField);
+          return next;
+        });
+      })
+      .catch((err) => {
+        console.error('useResourceData: preview SetSelectedFields failed:', err);
+        setLoadingFields(prev => {
+          const next = new Set(prev);
+          next.delete(debouncedPreviewField);
+          return next;
+        });
+      });
+  }, [watch, gvk, watchStatus, debouncedPreviewField, selectedFields]);
 
   // Batch processor: apply delta updates and fetch remaining resources
   // Delta updates (with fields in event) are applied directly without GetResourcesByKeys
@@ -432,12 +588,17 @@ export function useResourceData(
       if (!hasReceivedFirstBatch.current) {
         hasReceivedFirstBatch.current = true;
         setLoading(false);
+        // Clear loadingFields - field data has arrived
+        setLoadingFields(new Set());
       }
     };
 
     const timer = setInterval(flush, batchInterval);
     return () => clearInterval(timer);
-  }, [watch, batchInterval, gvk]);
+    // IMPORTANT: Dependencies must match the main watch effect to keep watchGen in sync.
+    // If the main effect re-runs and increments watchGen, this effect must also re-run
+    // to capture the new watchGen, otherwise flush will skip due to mismatch.
+  }, [watch, batchInterval, gvk, contexts, fieldChangeRestartKey]);
 
   // Manual refresh - restarts the watch
   const refresh = useCallback(() => {
@@ -534,5 +695,7 @@ export function useResourceData(
     watchStatus,
     getRowId,
     changedCells,
+    loadingFields,
+    extractedFields,
   };
 }

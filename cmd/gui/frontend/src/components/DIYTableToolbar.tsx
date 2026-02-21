@@ -18,6 +18,8 @@ interface DIYTableToolbarProps {
   onGlobalFilterChange: (value: string) => void;
   filteredRowCount: number;
   totalRowCount: number;
+  /** Whether data is still loading (hides count during initial load) */
+  isLoading?: boolean;
   // Export data
   headers: string[];
   rows: any[][];
@@ -40,6 +42,7 @@ export const DIYTableToolbar = forwardRef<DIYTableToolbarHandle, DIYTableToolbar
   onGlobalFilterChange,
   filteredRowCount,
   totalRowCount,
+  isLoading = false,
   headers,
   rows,
   resourceKind = 'resources',
@@ -134,9 +137,11 @@ export const DIYTableToolbar = forwardRef<DIYTableToolbarHandle, DIYTableToolbar
             className="w-48 h-6 py-0 px-2 text-sm"
           />
           <span className="text-sm text-muted-foreground whitespace-nowrap">
-            {globalFilter
-              ? `${filteredRowCount}/${totalRowCount} ${pluralize(resourceKind)}`
-              : `${totalRowCount} ${pluralize(resourceKind)}`
+            {isLoading
+              ? `Loading ${pluralize(resourceKind)}...`
+              : globalFilter
+                ? `${filteredRowCount}/${totalRowCount} ${pluralize(resourceKind)}`
+                : `${totalRowCount} ${pluralize(resourceKind)}`
             }
           </span>
         </div>

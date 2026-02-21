@@ -16,10 +16,15 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: .go-version
+      - name: Install SQLite dev headers
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
       - name: Install Ginkgo
         run: go install github.com/onsi/ginkgo/v2/ginkgo@latest
       - name: Run Go tests
         run: ginkgo -r -v --skip-package=cmd/gui
+        env:
+          CGO_ENABLED: 1
 
       - name: Run Go linting
         uses: golangci/golangci-lint-action@v6

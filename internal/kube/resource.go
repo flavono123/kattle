@@ -373,6 +373,12 @@ func (i *ResourceController) Done() <-chan struct{} {
 	return i.doneCh
 }
 
+// ListAll performs a one-shot LIST of all resources for this controller's GVR.
+// Used for on-demand field re-extraction when new fields are selected (cache miss).
+func (i *ResourceController) ListAll() (*unstructured.UnstructuredList, error) {
+	return i.client.Resource(i.gvr).Namespace("").List(context.Background(), metav1.ListOptions{})
+}
+
 // Close marks the controller as closed and signals consumers to stop.
 // After Close is called, new events will be dropped.
 // It is safe to call Close multiple times (subsequent calls are no-ops).

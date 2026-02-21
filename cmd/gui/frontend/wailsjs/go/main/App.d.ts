@@ -18,11 +18,19 @@ export function GetGVKs(arg1:Array<string>):Promise<Array<main.MultiClusterGVK>>
 
 export function GetNodeTree(arg1:main.MultiClusterGVK,arg2:Array<string>):Promise<Array<main.TreeNode>>;
 
-export function GetResources(arg1:main.MultiClusterGVK,arg2:Array<string>):Promise<Array<Record<string, any>>>;
+export function GetResourceCount():Promise<number>;
+
+export function GetResourceCountFiltered(arg1:string):Promise<number>;
 
 export function GetResourcesByKeys(arg1:Array<string>):Promise<Array<Record<string, any>>>;
 
+export function GetResourcesRange(arg1:number,arg2:number,arg3:string,arg4:boolean):Promise<Array<Record<string, any>>>;
+
+export function GetResourcesRangeFiltered(arg1:string):Promise<Array<Record<string, any>>>;
+
 export function Greet(arg1:string):Promise<string>;
+
+export function IsWindowedModeEnabled():Promise<boolean>;
 
 export function ListContexts():Promise<Array<string>>;
 
@@ -36,7 +44,7 @@ export function SaveFavoriteView(arg1:string,arg2:string,arg3:string,arg4:string
 
 export function SaveFile(arg1:string,arg2:string):Promise<string>;
 
-export function SetSelectedFields(arg1:Array<string>):Promise<void>;
+export function SetSelectedFields(arg1:Array<string>):Promise<main.SetSelectedFieldsResult>;
 
 export function StartWatch(arg1:main.MultiClusterGVK,arg2:Array<string>,arg3:Array<string>):Promise<void>;
 

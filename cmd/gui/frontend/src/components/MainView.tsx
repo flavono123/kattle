@@ -10,7 +10,7 @@ import { Button } from "./ui/button";
 import { Kbd } from "./ui/kbd";
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "./ui/resizable";
 import { PanelLeft } from "lucide-react";
-import { GetGVKs } from "../../wailsjs/go/main/App";
+import { GetGVKs, IsWindowedModeEnabled } from "../../wailsjs/go/main/App";
 import { main } from "../../wailsjs/go/models";
 import { ImperativePanelHandle } from "react-resizable-panels";
 import { useFavoriteViews } from "@/hooks/useFavoriteViews";
@@ -48,6 +48,7 @@ export function MainView({ selectedContexts, connectedContexts, onBackToContexts
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [sidebarWidthPercent, setSidebarWidthPercent] = useState(20); // Track sidebar width for ContextBar alignment
   const [focusedPanel, setFocusedPanel] = useState<FocusedPanel>(null);
+  const [useWindowedMode, setUseWindowedMode] = useState(false); // Controlled by KATTLE_USE_SQLSTORE env
   const { setTheme, resolvedTheme } = useTheme();
 
   // Handle theme toggle with animation
@@ -98,6 +99,13 @@ export function MainView({ selectedContexts, connectedContexts, onBackToContexts
       console.log("MainView: Loading GVKs for contexts:", connectedContexts);
       setLoading(true);
       try {
+        // Check if windowed mode should be enabled (KATTLE_USE_SQLSTORE=1)
+        const windowedEnabled = await IsWindowedModeEnabled();
+        setUseWindowedMode(windowedEnabled);
+        if (windowedEnabled) {
+          console.log("MainView: Windowed mode enabled (KATTLE_USE_SQLSTORE=1)");
+        }
+
         const gvkList = await GetGVKs(connectedContexts);
         console.log("MainView: Loaded GVKs:", gvkList.length, "items");
         setGVKs(gvkList);
@@ -459,6 +467,7 @@ export function MainView({ selectedContexts, connectedContexts, onBackToContexts
                 selectedGVK={selectedGVK}
                 connectedContexts={connectedContexts}
                 isTableFocused={focusedPanel === 'table'}
+                useWindowedMode={useWindowedMode}
                 onFieldsReorder={handleFieldsReorder}
                 onFieldRemove={handleFieldRemove}
                 onColumnFocus={setFocusedFieldPath}

@@ -70,9 +70,16 @@ For memory observation scenarios, automate UI interactions:
 - Wait for stabilization periods
 - Capture profiles at specified checkpoints
 
+**UI Automation Target:**
+- **DEFAULT: `http://localhost:34115`** (Wails dev - full app with Go backend)
+- Fallback: `http://localhost:5173` (Vite standalone - frontend only, no backend)
+
+**IMPORTANT:** Always use port **34115** for Playwright browser_navigate unless explicitly told otherwise.
+
 **Prerequisites check before Playwright:**
 ```bash
-curl -s http://localhost:5173/ > /dev/null && echo "Vite OK" || echo "Vite not running"
+# Wails dev server (PRIMARY - always use this for UI automation)
+curl -s http://localhost:34115/ > /dev/null && echo "Wails OK" || echo "Wails not running on port 34115"
 ```
 
 ## Verification Workflow
